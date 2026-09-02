@@ -3,9 +3,16 @@ AI Scenario Assistant — natural language -> scenario patch, via Claude tool us
 
 Single-call pattern (no agentic loop): send the user's message plus a system
 prompt describing the current network (warehouse ids/names/current status)
-and one tool (update_scenario), with tool_choice left at the default "auto".
-Claude's response may contain a text block (a clarifying question), a
-tool_use block (the proposed patch), or both.
+and two tools (update_scenario, reassign_stores), with tool_choice left at
+the default "auto". Claude's response may contain a text block (a clarifying
+question), one or more tool_use blocks (it can call both tools in one turn,
+e.g. "close Berlin and move its stores to Hamburg"), or both.
+
+reassign_stores never needs Claude to know individual store ids (there are
+400 of them — far too many to list in every prompt) — it just names a
+from/to warehouse pair, and _stores_for_warehouse() resolves which stores
+that covers in Python, from each store's PRIMARY warehouse in
+delivery_baseline_share (its highest-share WH).
 
 Claude never reports success/failure itself — it only proposes a patch. The
 caller (app.py) applies it via state.update_scenario() and runs
@@ -22,9 +29,9 @@ MODEL = "claude-opus-5"
 UPDATE_SCENARIO_TOOL = {
     "name": "update_scenario",
     "description": (
-        "Apply a partial update to the network scenario — currently just which "
-        "warehouses are open or closed. Only include warehouses whose status "
-        "should actually change; omit warehouses that stay as they are."
+        "Apply a partial update to the network scenario — which warehouses are open "
+        "or closed. Only include warehouses whose status should actually change; omit "
+        "warehouses that stay as they are."
     ),
     "input_schema": {
         "type": "object",
@@ -39,6 +46,27 @@ UPDATE_SCENARIO_TOOL = {
     },
 }
 
+REASSIGN_STORES_TOOL = {
+    "name": "reassign_stores",
+    "description": (
+        "Force every store currently primarily served by one warehouse to be served "
+        "only by a different warehouse instead of leaving that free for the solver to "
+        "optimize — e.g. 'move Berlin's stores to Hamburg' when closing Berlin. You do "
+        "NOT need to know individual store ids; this resolves them automatically from "
+        "which warehouse currently serves each store. Use group_id='ALL' unless the "
+        "user names a specific product group."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "from_wh_id": {"type": "string", "description": "Warehouse currently serving the stores to move."},
+            "to_wh_id": {"type": "string", "description": "Warehouse the stores should be forced onto."},
+            "group_id": {"type": "string", "description": "Product group id, or 'ALL' for every group."},
+        },
+        "required": ["from_wh_id", "to_wh_id", "group_id"],
+    },
+}
+
 
 @st.cache_resource(show_spinner=False)
 def _get_client():
@@ -49,9 +77,8 @@ def _build_system_prompt(warehouses_df, wh_status: dict) -> str:
     lines = [
         "You are a scenario assistant for a supply chain network design tool "
         "(DIY/home-improvement retail, Germany). The user describes network "
-        "changes in plain language (e.g. 'close the Hamburg warehouse', "
-        "'reopen WH004') and you translate that into a call to the "
-        "update_scenario tool using the exact warehouse_id.",
+        "changes in plain language and you translate that into tool calls using "
+        "exact warehouse_ids.",
         "",
         "Warehouses (id — name, city, current status):",
     ]
@@ -62,10 +89,15 @@ def _build_system_prompt(warehouses_df, wh_status: dict) -> str:
         "",
         "Rules:",
         "- Resolve city or warehouse names to the exact warehouse_id from the list above.",
-        "- Only call update_scenario when you're confident which warehouse(s) and status "
-        "the user means. If the request is ambiguous, references a warehouse not in the "
-        "list, or isn't about warehouse status, ask a short clarifying question instead "
-        "of guessing — don't call the tool in that case.",
+        "- Use update_scenario for opening/closing warehouses, and reassign_stores for "
+        "forcing one warehouse's stores onto another. A single request can need both "
+        "(e.g. 'close Berlin and move its stores to Hamburg' = one update_scenario call "
+        "closing WH002 + one reassign_stores call from WH002 to WH001) — call both tools "
+        "in the same turn when that happens.",
+        "- Only call a tool when you're confident which warehouse(s) the user means. If "
+        "the request is ambiguous, references a warehouse not in the list, or isn't about "
+        "warehouse status or store reassignment, ask a short clarifying question instead "
+        "of guessing — don't call a tool in that case.",
         "- Don't claim the change has been solved or that it succeeded — the app applies "
         "your patch and reports the real result separately.",
         "- Keep replies to one short sentence.",
@@ -73,13 +105,21 @@ def _build_system_prompt(warehouses_df, wh_status: dict) -> str:
     return "\n".join(lines)
 
 
-def interpret_message(user_message: str, chat_history: list, warehouses_df, wh_status: dict) -> dict:
+def _stores_for_warehouse(delivery_baseline_share, wh_id: str) -> list:
+    """Store ids whose PRIMARY warehouse (highest average volume_share) is wh_id."""
+    by_store_wh = delivery_baseline_share.groupby(["store_id", "wh_id"])["volume_share"].mean().reset_index()
+    primary = by_store_wh.loc[by_store_wh.groupby("store_id")["volume_share"].idxmax()]
+    return primary.loc[primary["wh_id"] == wh_id, "store_id"].tolist()
+
+
+def interpret_message(user_message: str, chat_history: list, warehouses_df,
+                       wh_status: dict, delivery_baseline_share) -> dict:
     """
     Returns {"reply": str | None, "patch": dict | None, "error": str | None}.
 
     `patch` is a partial scenario dict ready for state.update_scenario() —
-    already filtered to known warehouse ids and valid statuses, so it's safe
-    to apply without re-validating.
+    wh_status keys and forced_allocation rows are already filtered to known
+    warehouse ids, so it's safe to apply without re-validating.
     """
     try:
         client = _get_client()
@@ -91,7 +131,7 @@ def interpret_message(user_message: str, chat_history: list, warehouses_df, wh_s
             max_tokens=1024,
             output_config={"effort": "low"},  # simple slot-filling task, doesn't need deep reasoning
             system=_build_system_prompt(warehouses_df, wh_status),
-            tools=[UPDATE_SCENARIO_TOOL],
+            tools=[UPDATE_SCENARIO_TOOL, REASSIGN_STORES_TOOL],
             messages=messages,
         )
     except anthropic.AuthenticationError:
@@ -106,15 +146,32 @@ def interpret_message(user_message: str, chat_history: list, warehouses_df, wh_s
 
     reply_text = " ".join(b.text for b in response.content if b.type == "text").strip() or None
 
-    patch = None
     valid_wh_ids = set(warehouses_df["wh_id"])
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "update_scenario":
-            raw_status = block.input.get("wh_status", {})
-            cleaned = {wh: status for wh, status in raw_status.items()
-                       if wh in valid_wh_ids and status in ("open", "closed")}
-            if cleaned:
-                patch = {"wh_status": cleaned}
-            break
+    wh_status_patch = {}
+    forced_allocation_patch = []
 
-    return {"reply": reply_text, "patch": patch, "error": None}
+    for block in response.content:
+        if block.type != "tool_use":
+            continue
+
+        if block.name == "update_scenario":
+            raw_status = block.input.get("wh_status", {})
+            wh_status_patch.update({wh: status for wh, status in raw_status.items()
+                                     if wh in valid_wh_ids and status in ("open", "closed")})
+
+        elif block.name == "reassign_stores":
+            from_wh, to_wh, group_id = block.input.get("from_wh_id"), block.input.get("to_wh_id"), block.input.get("group_id", "ALL")
+            if from_wh in valid_wh_ids and to_wh in valid_wh_ids:
+                store_ids = _stores_for_warehouse(delivery_baseline_share, from_wh)
+                forced_allocation_patch.extend(
+                    {"store_id": sid, "group_id": group_id, "wh_id": to_wh, "volume_share": None}
+                    for sid in store_ids
+                )
+
+    patch = {}
+    if wh_status_patch:
+        patch["wh_status"] = wh_status_patch
+    if forced_allocation_patch:
+        patch["forced_allocation"] = forced_allocation_patch
+
+    return {"reply": reply_text, "patch": patch or None, "error": None}

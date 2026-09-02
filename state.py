@@ -42,6 +42,11 @@ def init_session_state():
         st.session_state.scenario = {
             # dict: wh_id -> "open" | "closed"
             "wh_status": {wh_id: "open" for wh_id in ref["warehouses"]["wh_id"]},
+            # list of {"store_id", "group_id" (or "ALL"), "wh_id", "volume_share"} rows —
+            # pins that (store, group) demand to specific warehouse(s) instead of leaving
+            # it fully open to the solver. See update_scenario() for upsert/unpin rules
+            # and solver.py's _resolve_forced_allocation() for how it's applied.
+            "forced_allocation": [],
         }
         st.session_state.results = None        # solve_network() output, or a loaded saved scenario's
         st.session_state.chat_history = []      # populated once AI chat is added
@@ -59,20 +64,33 @@ def init_session_state():
     if "active_scenario_id" not in st.session_state:
         st.session_state.active_scenario_id = None  # scenario_id if `results` came from the library, else None (live/unsaved)
 
+    st.session_state.scenario.setdefault("forced_allocation", [])  # ditto, for scenarios saved before this existed
+
 
 def update_scenario(patch: dict):
     """
     Merge a partial update into the scenario.
     This is the single entry point both manual UI controls AND
-    the future AI chat parser should call — never mutate
+    the AI chat (chat_assistant.py) should call — never mutate
     st.session_state.scenario directly from elsewhere.
+
+    "forced_allocation" gets upsert/unpin semantics instead of a plain merge:
+    patch["forced_allocation"] is a list of rows, each replacing any existing
+    pin(s) for the same (store_id, group_id) — a row with wh_id=None removes
+    the pin without adding a new one. This lets a single patch also express a
+    multi-warehouse split (e.g. 70%/30%) without the rows clobbering each other.
 
     Any edit invalidates whatever `results` is currently loaded (a prior
     solve, or a scenario picked from the library) — it no longer corresponds
     to the edited scenario, so drop back to "live/unsaved" until re-solved.
     """
     for key, value in patch.items():
-        if key in st.session_state.scenario and isinstance(value, dict):
+        if key == "forced_allocation":
+            current = st.session_state.scenario.setdefault("forced_allocation", [])
+            replaced_keys = {(row["store_id"], row["group_id"]) for row in value}
+            current[:] = [row for row in current if (row["store_id"], row["group_id"]) not in replaced_keys]
+            current.extend(row for row in value if row.get("wh_id") is not None)
+        elif key in st.session_state.scenario and isinstance(value, dict):
             st.session_state.scenario[key].update(value)
         else:
             st.session_state.scenario[key] = value

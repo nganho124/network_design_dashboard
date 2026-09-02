@@ -27,8 +27,19 @@ LIVE_OPTION = "__live__"  # sentinel for "current, unsaved edits" in the scenari
 
 def _format_patch_summary(patch: dict, warehouses_df) -> str:
     wh_names = warehouses_df.set_index("wh_id")["wh_name"].to_dict()
-    changes = patch.get("wh_status", {})
-    return ", ".join(f"{wh_names.get(wh, wh)} → {status}" for wh, status in changes.items())
+    parts = [f"{wh_names.get(wh, wh)} → {status}" for wh, status in patch.get("wh_status", {}).items()]
+
+    forced = patch.get("forced_allocation", [])
+    if forced:
+        # group by (group_id, wh_id) so "reassign 40 stores" reads as one line, not 40
+        by_target = {}
+        for row in forced:
+            by_target.setdefault((row["group_id"], row["wh_id"]), []).append(row["store_id"])
+        for (group_id, wh_id), store_ids in by_target.items():
+            group_note = "" if group_id == "ALL" else f" ({group_id})"
+            parts.append(f"{len(store_ids)} store(s){group_note} forced to {wh_names.get(wh_id, wh_id)}")
+
+    return ", ".join(parts)
 
 
 def scenario_chat_sidebar():
@@ -59,6 +70,7 @@ def scenario_chat_sidebar():
     result = chat_assistant.interpret_message(
         user_msg, st.session_state.chat_history[:-1],
         st.session_state.warehouses, st.session_state.scenario["wh_status"],
+        st.session_state.delivery_baseline_share,
     )
 
     if result["error"]:
@@ -95,6 +107,7 @@ def _solve_current_scenario():
             st.session_state.supply_share,
             st.session_state.inbound_cost_tiers,
             st.session_state.transfer_cost,
+            st.session_state.scenario.get("forced_allocation", []),
         )
     st.session_state.results = results
     st.session_state.active_scenario_id = None  # freshly solved, not yet saved
@@ -141,6 +154,7 @@ def scenario_library_sidebar():
         else:
             record = db.load_scenario(selected)
             st.session_state.scenario = record["scenario_patch"]
+            st.session_state.scenario.setdefault("forced_allocation", [])  # scenarios saved before this existed
             flows = record["flows"]
             st.session_state.results = {
                 "feasible": bool(record["feasible"]),

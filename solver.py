@@ -22,12 +22,53 @@ Import cost is a step function of shipment size (an "all-units quantity
 discount"), which needs binary tier-selection variables — so this is a MIP,
 solved with CBC, not the plain LP (GLOP) used previously.
 
+Optionally, `forced_allocation` pins specific (store, group) demand to a
+fixed set of warehouses instead of leaving it fully open to the optimizer —
+see state.py's scenario docstring for the row shape and app.py/chat_assistant.py
+for how the chat sets it (e.g. "move Berlin's stores to Hamburg").
+
 solve_network() is a PURE function: (scenario, reference data) -> results.
 No Streamlit, no globals.
 """
 
+from collections import defaultdict
+
 import pandas as pd
 from ortools.linear_solver import pywraplp
+
+
+def _resolve_forced_allocation(forced_allocation: list, demand: pd.DataFrame, open_wh: list):
+    """
+    Expands forced_allocation rows (group_id may be "ALL") into a per-(store,group)
+    lookup of {wh_id, volume_share} pins, and validates them.
+
+    Returns (pinned_by_store_group, error_reason). error_reason is set (and the
+    lookup is meaningless) if a pin references a closed warehouse, or a
+    (store, group)'s pins mix set/unset volume_share or don't sum to 1.0 —
+    solve_network() should fail fast with that reason rather than silently
+    dropping or misapplying the pin.
+    """
+    demand_groups_by_store = demand.groupby("store_id")["group_id"].apply(list).to_dict()
+    pinned = defaultdict(list)
+    for row in forced_allocation:
+        store_id, group_id, wh_id = row["store_id"], row["group_id"], row["wh_id"]
+        share = row.get("volume_share")
+        group_ids = demand_groups_by_store.get(store_id, []) if group_id == "ALL" else [group_id]
+        for gid in group_ids:
+            pinned[(store_id, gid)].append({"wh_id": wh_id, "volume_share": share})
+
+    for (store_id, group_id), pins in pinned.items():
+        for p in pins:
+            if p["wh_id"] not in open_wh:
+                return None, (f"Store {store_id} (group {group_id}) is pinned to "
+                               f"{p['wh_id']}, which is closed.")
+        shares = [p["volume_share"] for p in pins]
+        if any(s is not None for s in shares):
+            if any(s is None for s in shares) or abs(sum(shares) - 1.0) > 1e-6:
+                return None, (f"Store {store_id} (group {group_id}) forced_allocation "
+                               f"volume_shares must all be set and sum to 1.0.")
+
+    return dict(pinned), None
 
 
 def solve_network(scenario: dict,
@@ -38,7 +79,8 @@ def solve_network(scenario: dict,
                    inbound_cost: pd.DataFrame,
                    supply_share: pd.DataFrame,
                    inbound_cost_tiers: pd.DataFrame,
-                   transfer_cost: pd.DataFrame) -> dict:
+                   transfer_cost: pd.DataFrame,
+                   forced_allocation: list | None = None) -> dict:
     open_wh = [wh for wh, status in scenario["wh_status"].items() if status == "open"]
     if not open_wh:
         return {"feasible": False, "reason": "No warehouses are open — every store would be unserved."}
@@ -50,6 +92,10 @@ def solve_network(scenario: dict,
                 "reason": f"Open warehouse capacity ({total_capacity:,.0f} plt) is below total "
                           f"demand ({total_demand:,.0f} plt) — open more warehouses."}
 
+    pinned_by_store_group, pin_error = _resolve_forced_allocation(forced_allocation or [], demand, open_wh)
+    if pin_error:
+        return {"feasible": False, "reason": pin_error}
+
     solver = pywraplp.Solver.CreateSolver("CBC")
     inf = solver.infinity()
 
@@ -60,7 +106,6 @@ def solve_network(scenario: dict,
     transfer_cost_dict = transfer_cost.set_index(["wh_id_from", "wh_id_to"])["cost_per_pallet_eur"].to_dict()
 
     demand_recs = demand.to_dict("records")
-    store_groups = [(dr["store_id"], dr["group_id"]) for dr in demand_recs]
     groups = sorted(demand["group_id"].unique())
 
     # --- eligible (supplier, group) pairs and each supplier's network-wide cap ---
@@ -89,12 +134,20 @@ def solve_network(scenario: dict,
     # Decision variables
     # =========================================================================
 
-    # distribution flow: wh -> store, per group
+    # distribution flow: wh -> store, per group — restricted to the pinned warehouse(s)
+    # when forced_allocation applies to that (store, group), else all open warehouses
     dist_flow = {}
+    dist_flow_by_wh = defaultdict(list)         # wh_id -> [var, ...], for the capacity constraint
+    dist_flow_by_wh_group = defaultdict(list)   # (wh_id, group_id) -> [var, ...], for flow balance
     for dr in demand_recs:
         store_id, group_id = dr["store_id"], dr["group_id"]
-        for wh_id in open_wh:
-            dist_flow[(wh_id, store_id, group_id)] = solver.NumVar(0, inf, f"d_{wh_id}_{store_id}_{group_id}")
+        pins = pinned_by_store_group.get((store_id, group_id))
+        eligible_wh = [p["wh_id"] for p in pins] if pins else open_wh
+        for wh_id in eligible_wh:
+            var = solver.NumVar(0, inf, f"d_{wh_id}_{store_id}_{group_id}")
+            dist_flow[(wh_id, store_id, group_id)] = var
+            dist_flow_by_wh[wh_id].append(var)
+            dist_flow_by_wh_group[(wh_id, group_id)].append(var)
 
     # sourcing flow: supplier -> wh, per group (only eligible supplier/group pairs)
     inbound_flow = {}
@@ -128,19 +181,27 @@ def solve_network(scenario: dict,
     # Constraints
     # =========================================================================
 
-    # demand satisfaction: every store-group fully served
+    # demand satisfaction: every store-group fully served, across whichever warehouses
+    # are eligible for it (all open ones, or just the forced_allocation pin(s))
     for dr in demand_recs:
         store_id, group_id, qty = dr["store_id"], dr["group_id"], dr["demand_pallets"]
-        solver.Add(sum(dist_flow[(wh_id, store_id, group_id)] for wh_id in open_wh) == qty)
+        pins = pinned_by_store_group.get((store_id, group_id))
+        eligible_wh = [p["wh_id"] for p in pins] if pins else open_wh
+        solver.Add(sum(dist_flow[(wh_id, store_id, group_id)] for wh_id in eligible_wh) == qty)
+
+        # hard-fixed split: pin(s) with an explicit volume_share exactly determine that
+        # warehouse's flow, rather than just restricting which warehouses are eligible
+        if pins and pins[0]["volume_share"] is not None:
+            for p in pins:
+                solver.Add(dist_flow[(p["wh_id"], store_id, group_id)] == qty * p["volume_share"])
 
     # warehouse throughput capacity: outbound-to-store + outbound-transfer, which by flow
     # balance (below) equals total inbound — this is what actually caps a consolidation
     # hub's volume, not just what it ships directly to stores
     for wh_id in open_wh:
         cap = warehouses.loc[warehouses["wh_id"] == wh_id, "capacity_pallets"].iloc[0]
-        outbound_terms = [dist_flow[(wh_id, s, g)] for s, g in store_groups]
         transfer_out_terms = [var for (wf, _, _), var in transfer_flow.items() if wf == wh_id]
-        solver.Add(sum(outbound_terms) + sum(transfer_out_terms) <= cap)
+        solver.Add(sum(dist_flow_by_wh[wh_id]) + sum(transfer_out_terms) <= cap)
 
     # flow balance per (wh, group): inbound + transfers-in == outbound-to-stores + transfers-out
     for wh_id in open_wh:
@@ -150,7 +211,7 @@ def solve_network(scenario: dict,
                               if (sid, wh_id, gid) in inbound_flow]
             transfer_in = [var for (_, wt, g), var in transfer_flow.items() if wt == wh_id and g == gid]
             transfer_out = [var for (wf, _, g), var in transfer_flow.items() if wf == wh_id and g == gid]
-            outbound_terms = [dist_flow[(wh_id, s, g)] for s, g in store_groups if g == gid]
+            outbound_terms = dist_flow_by_wh_group.get((wh_id, gid), [])
             solver.Add(sum(inbound_terms) + sum(transfer_in) == sum(outbound_terms) + sum(transfer_out))
 
     # supplier network-wide capacity cap, from supply_share
@@ -179,11 +240,10 @@ def solve_network(scenario: dict,
 
     cost_terms = []
 
-    for wh_id in open_wh:
-        for s, g in store_groups:
-            unit_cost = delivery_cost_dict.get((wh_id, s), 0)
-            if unit_cost:
-                cost_terms.append(unit_cost * dist_flow[(wh_id, s, g)])
+    for (wh_id, s, _), var in dist_flow.items():
+        unit_cost = delivery_cost_dict.get((wh_id, s), 0)
+        if unit_cost:
+            cost_terms.append(unit_cost * var)
 
     for (sid, wh_id, gid), var in inbound_flow.items():
         if (sid, wh_id) in tiers_by_pair:
@@ -205,8 +265,8 @@ def solve_network(scenario: dict,
     # has a real handling cost trade-off against the cheaper import tier
     for wh_id in open_wh:
         h = handling_cost.get(wh_id, 0)
-        for s, g in store_groups:
-            cost_terms.append(h * dist_flow[(wh_id, s, g)])
+        for var in dist_flow_by_wh[wh_id]:
+            cost_terms.append(h * var)
         for (wf, wt, gid), var in transfer_flow.items():
             if wf == wh_id:
                 cost_terms.append(h * var)
