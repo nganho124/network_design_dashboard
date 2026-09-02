@@ -63,8 +63,15 @@ def init_storage():
 # ---------------------------------------------------------------------------
 
 def save_reference_data(data: dict):
-    """data: dict of {table_name: DataFrame}, e.g. output of build_all_data()."""
+    """data: dict of {table_name: DataFrame}, e.g. output of build_all_data().
+
+    Full replace: clears any existing .parquet files first, so a table that
+    was renamed or removed (e.g. old supply_share -> supply_baseline_share)
+    doesn't linger as a stale file alongside the new ones.
+    """
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    for stale in REFERENCE_DIR.glob("*.parquet"):
+        stale.unlink()
     for name, df in data.items():
         df.to_parquet(REFERENCE_DIR / f"{name}.parquet", index=False)
 

@@ -1,22 +1,30 @@
 """
-Synthetic data generator — Germany network.
+Synthetic data generator — Germany network (DIY / Home Improvement & Furniture Retail).
 
-Structure: Supplier -> Warehouse (WH) -> Store
+Structure: Supplier -> Warehouse (WH) -> Store, unit of measure = PALLET throughout.
 
-Design choices (per spec):
+Design choices:
 - 30% of suppliers are international, carrying ~60% of total supply volume,
   with longer lead times than domestic suppliers.
-- 8 warehouses spread across Germany; capacity sized from the demand of
-  stores in their catchment area (nearest-WH assignment + buffer).
-- Total cost = inbound transport (supplier->WH) + storage/handling at WH
-  + delivery (WH->store). Inventory holding/DIO can be layered in later.
-
-Everything here is synthetic but geographically real (actual German city
-coordinates), so distances and resulting costs behave plausibly.
+- 8 warehouses spread across Germany (4 "Central" hubs in the biggest metros,
+  4 "Regional" hubs); capacity sized from catchment demand, floored/capped
+  around an even split, and rounded to the nearest 100 pallets.
+- Store demand is population-weighted but regionally adjusted: the
+  Rhine-Ruhr area around Cologne is deliberately thinned out (too many
+  closely-packed candidate cities over-represented it), while Bavaria and
+  Baden-Wuerttemberg are boosted.
+- Product groups: fewer pure hardware/plumbing categories, several
+  furniture categories (IKEA-style flat-pack / home furnishings) added.
+- supply_baseline_share (Supplier x WH x Group) and delivery_baseline_share
+  (WH x Store x Group) represent the FIXED baseline distribution — the
+  "no action taken" scenario, mirroring the real Reece-style Branch
+  Delivery Share / Supply Share datasets.
 """
 
 import numpy as np
 import pandas as pd
+
+import db
 
 RNG = np.random.default_rng(42)  # fixed seed so demo results are repeatable
 
@@ -80,11 +88,34 @@ GERMAN_CITIES = [
 _seen = set()
 GERMAN_CITIES = [c for c in GERMAN_CITIES if not (c[0] in _seen or _seen.add(c[0]))]
 
-# 8 warehouse hub cities — spread for national coverage (N/S/E/W/Central)
+# 8 warehouse hub cities — order matters: first 4 become "Central WH", rest "Regional WH"
 WAREHOUSE_CITIES = [
-    "Hamburg", "Berlin", "Munich", "Cologne",
-    "Frankfurt", "Stuttgart", "Leipzig", "Nuremberg",
+    "Hamburg", "Berlin", "Munich", "Cologne",       # Central WH (biggest metros)
+    "Frankfurt", "Stuttgart", "Leipzig", "Nuremberg",  # Regional WH
 ]
+CENTRAL_WH_CITIES = {"Hamburg", "Berlin", "Munich", "Cologne"}
+
+# Regional cost index (1.0 = national average) driving both fixed cost and
+# handling cost. Reflects the general, well-known pattern in German
+# commercial real-estate/labor markets: Bavaria/Baden-Wuerttemberg/Hesse run
+# highest, Berlin near average, former East Germany (Leipzig) lowest.
+# Approximate, illustrative — not sourced from a specific report.
+REGIONAL_COST_INDEX = {
+    "Munich": 1.35, "Stuttgart": 1.25, "Frankfurt": 1.20, "Hamburg": 1.15,
+    "Cologne": 1.10, "Berlin": 1.00, "Nuremberg": 0.90, "Leipzig": 0.80,
+}
+
+# regional demand weighting: thin out the densely-packed Rhine-Ruhr area
+# around Cologne, boost Bavaria and Baden-Wuerttemberg
+COLOGNE_COORD = (50.9375, 6.9603)
+COLOGNE_THIN_RADIUS_KM = 90
+COLOGNE_THIN_MULTIPLIER = 0.45
+BAVARIA_CITIES = {"Munich", "Nuremberg", "Augsburg", "Erlangen", "Fuerth",
+                   "Regensburg", "Ingolstadt", "Wuerzburg", "Landshut"}
+BW_CITIES = {"Stuttgart", "Heidelberg", "Karlsruhe", "Mannheim", "Ulm", "Reutlingen",
+             "Pforzheim", "Freiburg", "Konstanz", "Villingen-Schwenningen",
+             "Ravensburg", "Offenburg"}
+BOOST_MULTIPLIER = 1.8
 
 # international supplier hubs (name, country, lat, lon) — flavored to DIY/hardware sourcing patterns
 INTL_SUPPLIER_HUBS = [
@@ -103,17 +134,28 @@ DOMESTIC_SUPPLIER_CITIES = [
     "Saarbruecken", "Halle", "Bonn", "Muenster",
 ]
 
-# product groups: (group_id, category, weight_kg_per_unit, volume_cbm_per_unit, unit_value_eur)
+# Product groups: (group_id, category, weight_kg_per_pallet, unit_value_eur_per_pallet)
+# Reduced pure hardware/plumbing categories (merged several), added furniture
+# categories (flat-pack / home furnishings, IKEA-style) to diversify the mix.
 PRODUCT_GROUPS_RAW = [
-    ("PG01", "Power Tools", 2.4, 0.015, 85), ("PG02", "Hand Tools", 0.8, 0.004, 22),
-    ("PG03", "Fasteners", 0.05, 0.0002, 3), ("PG04", "Plumbing Fittings", 0.3, 0.001, 8),
-    ("PG05", "Electrical Components", 0.4, 0.002, 15), ("PG06", "Paint & Coatings", 3.0, 0.005, 18),
-    ("PG07", "Garden Equipment", 6.5, 0.04, 120), ("PG08", "Safety Gear (PPE)", 0.5, 0.003, 25),
-    ("PG09", "Adhesives & Sealants", 1.2, 0.0015, 12), ("PG10", "Timber & Boards", 12.0, 0.08, 45),
-    ("PG11", "Flooring Materials", 8.0, 0.03, 35), ("PG12", "HVAC Components", 5.5, 0.02, 95),
-    ("PG13", "Hardware & Fixtures", 0.6, 0.002, 10), ("PG14", "Cleaning Supplies", 1.5, 0.003, 9),
-    ("PG15", "Ladders & Access", 9.0, 0.06, 70), ("PG16", "Cabling & Wiring", 4.0, 0.01, 40),
-    ("PG17", "Insulation Materials", 2.0, 0.05, 20), ("PG18", "Workwear & Apparel", 0.7, 0.004, 30),
+    ("PG01", "Power & Hand Tools",       350, 9000),
+    ("PG02", "Fasteners & Fixings",      600, 3000),
+    ("PG03", "Plumbing & Fittings",      450, 4500),
+    ("PG04", "Electrical & Cabling",     400, 6000),
+    ("PG05", "Paint & Coatings",         550, 3500),
+    ("PG06", "Safety & Workwear",        250, 5000),
+    ("PG07", "Adhesives & Sealants",     500, 3200),
+    ("PG08", "Garden Equipment",         400, 7000),
+    ("PG09", "Timber & Boards",          700, 2800),
+    ("PG10", "Flooring Materials",       650, 3800),
+    ("PG11", "Insulation Materials",     300, 2200),
+    ("PG12", "Cleaning Supplies",        350, 1800),
+    ("PG13", "Ladders & Access",         380, 4200),
+    ("PG14", "Flat-Pack Furniture",      500, 8500),
+    ("PG15", "Storage & Shelving",       450, 6500),
+    ("PG16", "Kitchen & Cabinets",       600, 11000),
+    ("PG17", "Home Decor & Textiles",    200, 4000),
+    ("PG18", "Outdoor & Patio Furniture", 550, 9500),
 ]
 
 
@@ -125,13 +167,17 @@ def _haversine(lat1, lon1, lat2, lon2):
     return 2 * r * np.arcsin(np.sqrt(a))
 
 
+def _round_hundred(x):
+    return int(round(x / 100.0) * 100)
+
+
 # ---------------------------------------------------------------------------
 # Generators
 # ---------------------------------------------------------------------------
 
 def generate_product_groups() -> pd.DataFrame:
     return pd.DataFrame(PRODUCT_GROUPS_RAW, columns=[
-        "group_id", "category", "weight_kg_per_unit", "volume_cbm_per_unit", "unit_value_eur",
+        "group_id", "category", "weight_kg_per_pallet", "unit_value_eur_per_pallet",
     ])
 
 
@@ -140,36 +186,49 @@ def generate_warehouses() -> pd.DataFrame:
     rows = []
     for i, city in enumerate(WAREHOUSE_CITIES, start=1):
         lat, lon = city_lookup[city]
-        rows.append({"wh_id": f"WH_{city.upper()}", "city": city, "lat": lat, "lon": lon,
-                     "handling_base_cost_eur_per_unit": round(RNG.uniform(0.8, 1.4), 2),
-                     "fixed_cost_eur_per_month": int(RNG.uniform(35_000, 60_000))})
+        is_central = city in CENTRAL_WH_CITIES
+        wh_name = f"{'Central' if is_central else 'Regional'} WH {city}"
+        rows.append({
+            "wh_id": f"WH{i:03d}", "wh_name": wh_name, "city": city, "lat": lat, "lon": lon,
+            "regional_cost_index": REGIONAL_COST_INDEX.get(city, 1.0),
+        })
     return pd.DataFrame(rows)
 
 
+def _store_weight_multiplier(city_name: str, lat: float, lon: float) -> float:
+    if city_name in BAVARIA_CITIES or city_name in BW_CITIES:
+        return BOOST_MULTIPLIER
+    if _haversine(lat, lon, *COLOGNE_COORD) < COLOGNE_THIN_RADIUS_KM:
+        return COLOGNE_THIN_MULTIPLIER
+    return 1.0
+
+
 def generate_stores(product_groups: pd.DataFrame, n_stores: int = 400):
-    """Returns (stores_df, demand_df). One store per sampled city, demand scaled by population."""
-    # sub-linear population weighting (pop^0.6) so mega-cities like Berlin don't
-    # swallow the whole store network — retail footprints scale with population
-    # but saturate; smaller towns still get realistic representation
-    weights = np.array([pop for _, _, _, pop in GERMAN_CITIES], dtype=float) ** 0.6
+    """Returns (stores_df, demand_df). One store per sampled city, demand scaled by
+    population — with a regional multiplier to thin out the Cologne/Rhine-Ruhr
+    cluster and boost Bavaria / Baden-Wuerttemberg."""
+    raw_weights = []
+    for name, lat, lon, pop in GERMAN_CITIES:
+        w = (pop ** 0.6) * _store_weight_multiplier(name, lat, lon)
+        raw_weights.append(w)
+    weights = np.array(raw_weights)
     weights = weights / weights.sum()
+
     idx = RNG.choice(len(GERMAN_CITIES), size=n_stores, replace=True, p=weights)
 
     stores = []
     demand_rows = []
     for i, city_idx in enumerate(idx, start=1):
         name, lat, lon, pop = GERMAN_CITIES[city_idx]
-        # jitter location slightly so multiple stores in the same city don't overlap exactly
         jlat, jlon = lat + RNG.uniform(-0.05, 0.05), lon + RNG.uniform(-0.05, 0.05)
         store_id = f"ST_{i:03d}_{name.upper()}"
         stores.append({"store_id": store_id, "city": name, "lat": jlat, "lon": jlon})
 
-        base_demand = pop * RNG.uniform(0.4, 0.7)  # rough units/month scaling from population
+        base_demand = pop * RNG.uniform(0.45, 0.8)  # monthly pallet-demand base, scaled from population
         for _, pg in product_groups.iterrows():
-            share = RNG.dirichlet(np.ones(1))[0]  # placeholder, replaced below for realism
             demand_rows.append({
                 "store_id": store_id, "group_id": pg["group_id"],
-                "demand_units": max(1, int(base_demand * RNG.uniform(0.02, 0.08))),
+                "demand_pallets": max(1, int(base_demand * RNG.uniform(0.02, 0.06))),
             })
 
     return pd.DataFrame(stores), pd.DataFrame(demand_rows)
@@ -184,41 +243,29 @@ def generate_suppliers(n_suppliers: int = 20, intl_count_share: float = 0.30,
     dom_cities = [DOMESTIC_SUPPLIER_CITIES[i % len(DOMESTIC_SUPPLIER_CITIES)] for i in range(n_dom)]
     city_lookup = {name: (lat, lon) for name, lat, lon, _ in GERMAN_CITIES}
 
-    rows = []
-    # raw volume weights so international suppliers collectively land near intl_volume_share
     intl_raw = RNG.dirichlet(np.ones(n_intl)) * intl_volume_share
     dom_raw = RNG.dirichlet(np.ones(n_dom)) * (1 - intl_volume_share)
 
+    rows = []
+    sid = 1
     for i, (name, country, lat, lon) in enumerate(intl_hubs):
         rows.append({
-            "supplier_id": f"SUP_INTL_{i+1:02d}", "name": f"{name} {i+1}", "country": country,
+            "supplier_id": f"SUP_{sid:03d}", "name": f"{name} {i+1}", "country": country,
             "type": "international", "lat": lat, "lon": lon,
             "lead_time_days": int(RNG.uniform(25, 45)),
-            "volume_share": round(intl_raw[i], 4),
+            "volume_share": round(float(intl_raw[i]), 4),
         })
+        sid += 1
     for i, city in enumerate(dom_cities):
         lat, lon = city_lookup[city]
         rows.append({
-            "supplier_id": f"SUP_DOM_{i+1:02d}", "name": f"{city} Supplier", "country": "Germany",
+            "supplier_id": f"SUP_{sid:03d}", "name": f"{city} Supplier", "country": "Germany",
             "type": "domestic", "lat": lat, "lon": lon,
             "lead_time_days": int(RNG.uniform(2, 7)),
-            "volume_share": round(dom_raw[i], 4),
+            "volume_share": round(float(dom_raw[i]), 4),
         })
+        sid += 1
 
-    return pd.DataFrame(rows)
-
-
-def generate_supply_share(suppliers: pd.DataFrame, product_groups: pd.DataFrame,
-                           suppliers_per_group: int = 3) -> pd.DataFrame:
-    """Fixed Supplier -> (implicitly all WHs) share per product group, weighted by supplier volume_share."""
-    rows = []
-    for _, pg in product_groups.iterrows():
-        chosen = suppliers.sample(n=min(suppliers_per_group, len(suppliers)),
-                                   weights=suppliers["volume_share"], random_state=RNG.integers(0, 1e6))
-        shares = RNG.dirichlet(chosen["volume_share"].values + 0.01)
-        for (_, sup), share in zip(chosen.iterrows(), shares):
-            rows.append({"group_id": pg["group_id"], "supplier_id": sup["supplier_id"],
-                         "share": round(float(share), 3)})
     return pd.DataFrame(rows)
 
 
@@ -233,54 +280,147 @@ def assign_stores_to_nearest_wh(stores: pd.DataFrame, warehouses: pd.DataFrame) 
 def size_warehouse_capacity(warehouses: pd.DataFrame, stores: pd.DataFrame,
                              demand: pd.DataFrame, buffer: float = 1.15,
                              min_ratio: float = 0.35, max_ratio: float = 2.5) -> pd.DataFrame:
-    """
-    Capacity = nearest-catchment demand * buffer, but floored/capped relative
-    to an even split across warehouses. Pure nearest-neighbor assignment lets
-    one metro area (e.g. Berlin) dominate and starves smaller regions down to
-    unrealistically tiny capacity — the floor/cap keeps every warehouse
-    plausibly sized for a real regional network.
-    """
+    """Capacity = nearest-catchment demand * buffer, floored/capped relative to an
+    even split (so no single metro starves the others), then rounded to the
+    nearest 100 pallets."""
     nearest = assign_stores_to_nearest_wh(stores, warehouses).reset_index()
     demand_with_wh = demand.merge(nearest, on="store_id")
-    cap_by_wh = demand_with_wh.groupby("nearest_wh_id")["demand_units"].sum() * buffer
+    cap_by_wh = demand_with_wh.groupby("nearest_wh_id")["demand_pallets"].sum() * buffer
 
     n_wh = len(warehouses)
-    even_split = demand["demand_units"].sum() * buffer / n_wh
+    even_split = demand["demand_pallets"].sum() * buffer / n_wh
     floor, ceiling = even_split * min_ratio, even_split * max_ratio
 
     warehouses = warehouses.copy()
     raw_cap = warehouses["wh_id"].map(cap_by_wh).fillna(0)
-    warehouses["capacity_units"] = raw_cap.clip(lower=floor, upper=ceiling).astype(int)
+    clipped = raw_cap.clip(lower=floor, upper=ceiling)
+    warehouses["capacity_pallets"] = clipped.apply(_round_hundred).astype(int)
+    return warehouses
+
+
+def compute_warehouse_costs(warehouses: pd.DataFrame, rent_eur_per_pallet: float = 6.0,
+                             base_overhead_eur: float = 18_000.0,
+                             handling_base_eur: float = 10.0) -> pd.DataFrame:
+    """
+    Fixed cost and handling cost, both grounded in two real drivers instead
+    of pure randomness:
+      - warehouse SIZE (capacity_pallets) — a bigger footprint costs more
+        in rent and staffing, regardless of city
+      - REGIONAL cost index — rent and labor both scale with local cost of
+        living/commercial real estate
+
+    fixed_cost = (rent per pallet slot * capacity + base overhead) * regional index
+    handling_cost = base handling rate * regional index (labor-cost driven,
+        largely independent of warehouse size)
+
+    This is what keeps a small warehouse in a cheap region (e.g. Leipzig)
+    cheaper than a large one in an expensive region (e.g. Munich), and a
+    large warehouse in an average-cost region (e.g. Berlin) priced between
+    the two — rather than fixed cost being unrelated to size or location.
+    """
+    warehouses = warehouses.copy()
+    idx = warehouses["regional_cost_index"]
+    cap = warehouses["capacity_pallets"]
+
+    fixed_raw = (cap * rent_eur_per_pallet + base_overhead_eur) * idx
+    fixed_raw = fixed_raw * RNG.uniform(0.95, 1.05, size=len(warehouses))  # small realistic noise
+    warehouses["fixed_cost_eur_per_month"] = fixed_raw.apply(_round_hundred).astype(int)
+
+    handling_raw = handling_base_eur * idx * RNG.uniform(0.85, 1.15, size=len(warehouses))
+    warehouses["handling_cost_eur_pallet"] = handling_raw.round(2)
+
     return warehouses
 
 
 def compute_inbound_transport_cost(suppliers: pd.DataFrame, warehouses: pd.DataFrame) -> pd.DataFrame:
-    """Cost per unit, supplier -> each WH. International adds a flat customs/ocean-freight base fee."""
+    """Cost per pallet, supplier -> each WH. International adds a flat
+    ocean-freight/customs base fee reflecting real per-pallet import economics."""
     rows = []
     for _, sup in suppliers.iterrows():
         for _, wh in warehouses.iterrows():
             dist_km = _haversine(sup["lat"], sup["lon"], wh["lat"], wh["lon"])
             if sup["type"] == "international":
-                cost = 8.5 + 0.015 * dist_km   # base ocean/customs fee + inland leg
+                # ocean freight economizes over distance — base covers the sea leg,
+                # only a modest per-km term for inland/customs variance
+                cost = 150 + 0.01 * dist_km
             else:
-                cost = 0.06 * dist_km + 1.0    # domestic trucking
+                cost = 15 + 0.15 * dist_km    # domestic trucking, per pallet
             rows.append({"supplier_id": sup["supplier_id"], "wh_id": wh["wh_id"],
-                        "distance_km": round(dist_km, 1), "cost_per_unit_eur": round(cost, 2),
+                        "distance_km": round(dist_km, 1), "cost_per_pallet_eur": round(cost, 2),
                         "lead_time_days": sup["lead_time_days"]})
     return pd.DataFrame(rows)
 
 
 def compute_delivery_cost(warehouses: pd.DataFrame, stores: pd.DataFrame) -> pd.DataFrame:
-    """Cost per unit, WH -> store."""
+    """Cost per pallet, WH -> store (last-mile distribution)."""
     rows = []
     for _, wh in warehouses.iterrows():
         for _, s in stores.iterrows():
             dist_km = _haversine(wh["lat"], wh["lon"], s["lat"], s["lon"])
-            cost = 0.09 * dist_km + 1.5
+            cost = 15 + 0.12 * dist_km
             days = round(dist_km / 550 + 0.4, 2)
             rows.append({"wh_id": wh["wh_id"], "store_id": s["store_id"],
-                        "distance_km": round(dist_km, 1), "cost_per_unit_eur": round(cost, 2),
+                        "distance_km": round(dist_km, 1), "cost_per_pallet_eur": round(cost, 2),
                         "days_to_serve": days})
+    return pd.DataFrame(rows)
+
+
+def generate_supply_baseline_share(suppliers: pd.DataFrame, product_groups: pd.DataFrame,
+                                    warehouses: pd.DataFrame, inbound_cost: pd.DataFrame,
+                                    suppliers_per_group: int = 3) -> pd.DataFrame:
+    """Baseline fixed Supplier -> WH -> Group volume share (mirrors the real
+    'Supply Share' dataset). Suppliers are picked per (WH, group) weighted by
+    their overall volume_share AND proximity to that warehouse, so nearby
+    suppliers are more likely to feature in that WH's baseline mix."""
+    cost_lookup = inbound_cost.set_index(["wh_id", "supplier_id"])["distance_km"]
+    rows = []
+    for _, wh in warehouses.iterrows():
+        for _, pg in product_groups.iterrows():
+            dists = suppliers["supplier_id"].map(lambda sid: cost_lookup.get((wh["wh_id"], sid), np.nan))
+            dists = dists.fillna(dists.mean())
+            proximity_weight = 1.0 / (dists.values + 50)
+            combined = suppliers["volume_share"].values * proximity_weight
+            combined = combined / combined.sum()
+
+            n_pick = min(suppliers_per_group, len(suppliers))
+            chosen_idx = RNG.choice(len(suppliers), size=n_pick, replace=False, p=combined)
+            chosen = suppliers.iloc[chosen_idx]
+            raw_shares = RNG.dirichlet(np.ones(n_pick))
+            # round all but the last share, then derive the last so the group sums to exactly 1.0
+            shares = [round(float(s), 3) for s in raw_shares[:-1]]
+            shares.append(round(1 - sum(shares), 3))
+            for (_, sup), share in zip(chosen.iterrows(), shares):
+                rows.append({"supplier_id": sup["supplier_id"], "wh_id": wh["wh_id"],
+                            "group_id": pg["group_id"], "volume_share": share})
+    return pd.DataFrame(rows)
+
+
+def generate_delivery_baseline_share(stores: pd.DataFrame, warehouses: pd.DataFrame,
+                                      product_groups: pd.DataFrame,
+                                      primary_share_range=(0.85, 1.0)) -> pd.DataFrame:
+    """Baseline fixed WH -> Store -> Group volume share (mirrors the real
+    'Branch Delivery Share' dataset). Each store is served mostly by its
+    nearest WH, with a small residual share to the second-nearest WH to
+    reflect realistic occasional cross-shipping."""
+    rows = []
+    for _, s in stores.iterrows():
+        dists = warehouses.apply(lambda w: _haversine(s["lat"], s["lon"], w["lat"], w["lon"]), axis=1)
+        order = dists.sort_values().index.tolist()
+        primary_wh = warehouses.loc[order[0], "wh_id"]
+        secondary_wh = warehouses.loc[order[1], "wh_id"] if len(order) > 1 else None
+
+        primary_share = round(float(RNG.uniform(*primary_share_range)), 3)
+        if primary_share >= 0.999:
+            primary_share, secondary_wh = 1.0, None
+        else:
+            secondary_share = round(1 - primary_share, 3)
+
+        for _, pg in product_groups.iterrows():
+            rows.append({"wh_id": primary_wh, "store_id": s["store_id"],
+                        "group_id": pg["group_id"], "volume_share": primary_share})
+            if secondary_wh is not None:
+                rows.append({"wh_id": secondary_wh, "store_id": s["store_id"],
+                            "group_id": pg["group_id"], "volume_share": secondary_share})
     return pd.DataFrame(rows)
 
 
@@ -289,10 +429,12 @@ def build_all_data(n_stores: int = 400, n_suppliers: int = 20):
     warehouses = generate_warehouses()
     stores, demand = generate_stores(product_groups, n_stores=n_stores)
     warehouses = size_warehouse_capacity(warehouses, stores, demand)
+    warehouses = compute_warehouse_costs(warehouses)
     suppliers = generate_suppliers(n_suppliers=n_suppliers)
-    supply_share = generate_supply_share(suppliers, product_groups)
     inbound_cost = compute_inbound_transport_cost(suppliers, warehouses)
     delivery_cost = compute_delivery_cost(warehouses, stores)
+    supply_baseline_share = generate_supply_baseline_share(suppliers, product_groups, warehouses, inbound_cost)
+    delivery_baseline_share = generate_delivery_baseline_share(stores, warehouses, product_groups)
 
     return {
         "product_groups": product_groups,
@@ -300,9 +442,10 @@ def build_all_data(n_stores: int = 400, n_suppliers: int = 20):
         "stores": stores,
         "demand": demand,
         "suppliers": suppliers,
-        "supply_share": supply_share,
         "inbound_cost": inbound_cost,
         "delivery_cost": delivery_cost,
+        "supply_baseline_share": supply_baseline_share,
+        "delivery_baseline_share": delivery_baseline_share,
     }
 
 
@@ -312,9 +455,37 @@ if __name__ == "__main__":
         print(f"\n=== {name} ({len(df)} rows) ===")
         print(df.head(4).to_string(index=False))
 
-    intl_volume = data["suppliers"].loc[data["suppliers"]["type"] == "international", "volume_share"].sum()
-    print(f"\nInternational supplier count share: "
-          f"{(data['suppliers']['type'] == 'international').mean():.0%}")
-    print(f"International supplier volume share: {intl_volume:.0%}")
-    print(f"Total warehouse capacity: {data['warehouses']['capacity_units'].sum():,} units")
-    print(f"Total demand: {data['demand']['demand_units'].sum():,} units")
+    print("\n--- Validation ---")
+    wh = data["warehouses"]
+    print(wh[["wh_id", "wh_name", "regional_cost_index", "capacity_pallets",
+               "fixed_cost_eur_per_month", "handling_cost_eur_pallet"]]
+          .sort_values("capacity_pallets", ascending=False).to_string(index=False))
+    print(f"Max/min capacity ratio: {wh['capacity_pallets'].max() / wh['capacity_pallets'].min():.1f}x")
+    print(f"Fixed cost vs capacity correlation: {wh['fixed_cost_eur_per_month'].corr(wh['capacity_pallets']):.2f}")
+    print(f"Handling cost vs regional index correlation: "
+          f"{wh['handling_cost_eur_pallet'].corr(wh['regional_cost_index']):.2f}")
+
+    stores = data["stores"]
+    cologne_area = stores.apply(
+        lambda r: _haversine(r["lat"], r["lon"], *COLOGNE_COORD) < COLOGNE_THIN_RADIUS_KM, axis=1).sum()
+    bavaria_bw = stores["city"].isin(BAVARIA_CITIES | BW_CITIES).sum()
+    print(f"Stores near Cologne (<{COLOGNE_THIN_RADIUS_KM}km): {cologne_area} / {len(stores)}")
+    print(f"Stores in Bavaria/Baden-Wuerttemberg cities: {bavaria_bw} / {len(stores)}")
+
+    intl_vol = data["suppliers"].loc[data["suppliers"]["type"] == "international", "volume_share"].sum()
+    print(f"Intl supplier count share: {(data['suppliers']['type'] == 'international').mean():.0%}")
+    print(f"Intl supplier volume share: {intl_vol:.0%}")
+    print(f"Supplier IDs: {data['suppliers']['supplier_id'].tolist()}")
+
+    sbs = data["supply_baseline_share"]
+    check = sbs.groupby(["wh_id", "group_id"])["volume_share"].sum().round(3)
+    print(f"supply_baseline_share sums to 1.0 per (wh,group)? {(check == 1.0).all()}")
+
+    dbs = data["delivery_baseline_share"]
+    check2 = dbs.groupby(["store_id", "group_id"])["volume_share"].sum().round(3)
+    print(f"delivery_baseline_share sums to 1.0 per (store,group)? {(check2 == 1.0).all()}")
+
+    print("\n--- Saving to reference data ---")
+    db.init_storage()
+    db.save_reference_data(data)
+    print(f"Saved {len(data)} tables to {db.REFERENCE_DIR}/")
