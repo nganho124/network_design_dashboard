@@ -1,89 +1,132 @@
 """
 Network optimization model using OR-Tools (GLOP linear solver).
 
-This solves a transportation problem: given which DCs are open and the
-delivery mode chosen per region, find the min-cost way to serve all
-region demand from open DCs within their capacity.
+Scope: given which warehouses are OPEN (a scenario input, not something the
+solver decides — that's the user/AI chat's job), find the min-cost way to
+route every store's demand (per product group) from open warehouses,
+respecting each warehouse's capacity.
 
-solve_network() is intentionally a PURE function: (scenario, reference data) -> results.
-No Streamlit, no globals. This is what makes it a clean target for:
-  - manual UI controls (app.py calls it after any widget change)
-  - the AI chat tool-call on hackathon night (same function, same signature)
+Cost = delivery (WH->Store) + inbound (Supplier->WH, weighted by the
+baseline supply share) + handling (per pallet at the receiving WH) + fixed
+cost of the open warehouses (a constant, since it doesn't depend on routing).
+
+solve_network() is a PURE function: (scenario, reference data) -> results.
+No Streamlit, no globals — same design as the original toy solver, just
+rebuilt for the warehouse/store/pallet/multi-group schema.
 """
 
 import pandas as pd
 from ortools.linear_solver import pywraplp
 
 
-def solve_network(scenario: dict, dcs: pd.DataFrame, demand: pd.DataFrame,
-                   distance: pd.DataFrame) -> dict:
-    dc_status = scenario["dc_status"]
-    delivery_mode = scenario["delivery_mode"]
+def _weighted_inbound_cost(supply_baseline_share: pd.DataFrame, 
+                           inbound_cost: pd.DataFrame) -> dict:
+    """Precompute avg inbound cost per (wh_id, group_id), weighted by baseline supplier shares."""
+    merged = supply_baseline_share.merge(
+        inbound_cost[["supplier_id", "wh_id", "cost_per_pallet_eur"]], on=["supplier_id", "wh_id"])
+    merged["weighted"] = merged["volume_share"] * merged["cost_per_pallet_eur"]
+    avg = merged.groupby(["wh_id", "group_id"])["weighted"].sum()
+    return avg.to_dict()  # {(wh_id, group_id): cost_per_pallet}
 
-    open_dcs = [d for d, status in dc_status.items() if status == "open"]
-    if not open_dcs:
-        return {"feasible": False, "reason": "No DCs are open — every region would be unserved."}
+
+def solve_network(scenario: dict, 
+                  warehouses: pd.DataFrame, 
+                  stores: pd.DataFrame,
+                  demand: pd.DataFrame, 
+                  delivery_cost: pd.DataFrame, 
+                  inbound_cost: pd.DataFrame,
+                  supply_baseline_share: pd.DataFrame) -> dict:
+    open_wh = [wh for wh, status in scenario["wh_status"].items() if status == "open"]
+    if not open_wh:
+        return {"feasible": False, "reason": "No warehouses are open — every store would be unserved."}
+
+    total_capacity = warehouses[warehouses["wh_id"].isin(open_wh)]["capacity_pallets"].sum()
+    total_demand = demand["demand_pallets"].sum()
+    if total_capacity < total_demand:
+        return {"feasible": False,
+                "reason": f"Open warehouse capacity ({total_capacity:,.0f} plt) is below total "
+                          f"demand ({total_demand:,.0f} plt) — open more warehouses."}
+
+    avg_inbound = _weighted_inbound_cost(supply_baseline_share, inbound_cost)
+    handling_cost = warehouses.set_index("wh_id")["handling_cost_eur_pallet"].to_dict()
+
+    # plain dicts, not DataFrame .loc — .loc lookups inside a 50k+ iteration loop
+    # were the dominant cost (~7s of a ~14s solve for the full 8-warehouse network)
+    delivery_cost_dict = delivery_cost.set_index(["wh_id", "store_id"])["cost_per_pallet_eur"].to_dict()
+    days_to_serve_dict = delivery_cost.set_index(["wh_id", "store_id"])["days_to_serve"].to_dict()
 
     solver = pywraplp.Solver.CreateSolver("GLOP")
 
-    # Decision vars: flow[dc, region] = units shipped, only for open DCs
+    # --- decision variables: flow[wh, store, group] ---
     flow = {}
-    for dc_id in open_dcs:
-        for _, reg in demand.iterrows():
-            flow[(dc_id, reg["region_id"])] = solver.NumVar(0, solver.infinity(), f"flow_{dc_id}_{reg['region_id']}")
+    demand_recs = demand.to_dict("records")
+    for dr in demand_recs:
+        store_id, group_id = dr["store_id"], dr["group_id"]
+        for wh_id in open_wh:
+            flow[(wh_id, store_id, group_id)] = solver.NumVar(
+                0, solver.infinity(), f"f_{wh_id}_{store_id}_{group_id}")
 
-    # Demand satisfaction: each region's demand must be fully met
-    for _, reg in demand.iterrows():
-        solver.Add(
-            sum(flow[(dc_id, reg["region_id"])] for dc_id in open_dcs) == reg["demand_units"]
-        )
+    # --- demand satisfaction: every store-group fully served ---
+    for dr in demand_recs:
+        store_id, group_id, qty = dr["store_id"], dr["group_id"], dr["demand_pallets"]
+        solver.Add(sum(flow[(wh_id, store_id, group_id)] for wh_id in open_wh) == qty)
 
-    # Capacity constraint: each open DC can't exceed its capacity
-    for dc_id in open_dcs:
-        cap = dcs.loc[dcs["dc_id"] == dc_id, "capacity_units"].iloc[0]
-        solver.Add(
-            sum(flow[(dc_id, reg["region_id"])] for reg in demand.to_dict("records")) <= cap
-        )
+    # --- capacity: each open warehouse bounded ---
+    store_groups = [(dr["store_id"], dr["group_id"]) for dr in demand_recs]
+    for wh_id in open_wh:
+        cap = warehouses.loc[warehouses["wh_id"] == wh_id, "capacity_pallets"].iloc[0]
+        solver.Add(sum(flow[(wh_id, s, g)] for s, g in store_groups) <= cap)
 
-    # Objective: minimize total transport cost (mode-dependent, per region)
-    dist_lookup = distance.set_index(["dc_id", "region_id"])
+    # --- objective: delivery + inbound + handling, per pallet ---
     cost_terms = []
-    for dc_id in open_dcs:
-        for _, reg in demand.iterrows():
-            mode = delivery_mode.get(reg["region_id"], "direct")
-            cost_col = "cost_per_unit_direct" if mode == "direct" else "cost_per_unit_lsp"
-            unit_cost = dist_lookup.loc[(dc_id, reg["region_id"]), cost_col]
-            cost_terms.append(unit_cost * flow[(dc_id, reg["region_id"])])
+    for wh_id in open_wh:
+        handling = handling_cost.get(wh_id, 0)
+        for s, g in store_groups:
+            delivery = delivery_cost_dict.get((wh_id, s), 0)
+            inbound = avg_inbound.get((wh_id, g), 0)
+            unit_cost = delivery + inbound + handling
+            cost_terms.append(unit_cost * flow[(wh_id, s, g)])
     solver.Minimize(solver.Sum(cost_terms))
 
     status = solver.Solve()
     if status != pywraplp.Solver.OPTIMAL:
-        return {"feasible": False, "reason": "No feasible solution — check DC capacity vs total demand."}
+        return {"feasible": False, "reason": "Solver could not find an optimal solution."}
 
-    # Extract flows
-    flow_rows = []
-    for (dc_id, region_id), var in flow.items():
-        units = var.solution_value()
-        if units > 1e-3:
-            mode = delivery_mode.get(region_id, "direct")
-            days_col = "days_to_serve_direct" if mode == "direct" else "days_to_serve_lsp"
-            days = dist_lookup.loc[(dc_id, region_id), days_col]
-            flow_rows.append({
-                "dc_id": dc_id, "region_id": region_id, "units": round(units, 1),
-                "mode": mode, "days_to_serve": days,
-            })
-    flows_df = pd.DataFrame(flow_rows)
+    # --- extract results ---
+    rows = []
+    for (wh_id, store_id, group_id), var in flow.items():
+        val = var.solution_value()
+        if val > 1e-6:
+            rows.append({"wh_id": wh_id, "store_id": store_id, "group_id": group_id,
+                        "pallets": val, "days_to_serve": days_to_serve_dict.get((wh_id, store_id), 0)})
+    flows_detail = pd.DataFrame(rows)
 
-    total_cost = solver.Objective().Value()
-    fixed_cost = dcs[dcs["dc_id"].isin(open_dcs)]["fixed_cost_eur"].sum()
-    weighted_days = (flows_df["units"] * flows_df["days_to_serve"]).sum() / flows_df["units"].sum()
+    # aggregated to (wh_id, store_id) — this is what map_view.py / dashboard_view.py consume
+    flows = flows_detail.groupby(["wh_id", "store_id"], as_index=False)["pallets"].sum()
+
+    # vectorized cost totals (map/merge, not iterrows — iterrows over 7k+ rows was slow too)
+    flows_detail["delivery_unit_cost"] = flows_detail.apply(
+        lambda r: delivery_cost_dict.get((r["wh_id"], r["store_id"]), 0), axis=1)
+    flows_detail["inbound_unit_cost"] = flows_detail.apply(
+        lambda r: avg_inbound.get((r["wh_id"], r["group_id"]), 0), axis=1)
+    flows_detail["handling_unit_cost"] = flows_detail["wh_id"].map(handling_cost)
+
+    delivery_total = (flows_detail["pallets"] * flows_detail["delivery_unit_cost"]).sum()
+    inbound_total = (flows_detail["pallets"] * flows_detail["inbound_unit_cost"]).sum()
+    handling_total = (flows_detail["pallets"] * flows_detail["handling_unit_cost"]).sum()
+    fixed_total = warehouses[warehouses["wh_id"].isin(open_wh)]["fixed_cost_eur_per_month"].sum()
+
+    weighted_days = (flows_detail["pallets"] * flows_detail["days_to_serve"]).sum() / flows_detail["pallets"].sum()
 
     return {
         "feasible": True,
-        "total_variable_cost_eur": round(total_cost, 0),
-        "total_fixed_cost_eur": round(fixed_cost, 0),
-        "total_cost_eur": round(total_cost + fixed_cost, 0),
+        "flows": flows,                    # aggregated wh_id/store_id/pallets — for map/dashboard
+        "flows_detail": flows_detail,       # wh_id/store_id/group_id/pallets — for deeper inspection
+        "delivery_cost_eur": round(delivery_total, 0),
+        "inbound_cost_eur": round(inbound_total, 0),
+        "handling_cost_eur": round(handling_total, 0),
+        "fixed_cost_eur": round(fixed_total, 0),
+        "total_cost_eur": round(delivery_total + inbound_total + handling_total + fixed_total, 0),
         "avg_days_to_serve": round(weighted_days, 2),
-        "open_dc_count": len(open_dcs),
-        "flows": flows_df,
+        "open_wh_count": len(open_wh),
     }

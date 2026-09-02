@@ -5,23 +5,91 @@ Reads from st.session_state.scenario / warehouses / stores / demand /
 delivery_baseline_share (+ results, once solver.py is rewritten for this
 schema) ONLY. Writes back to scenario via state.update_scenario() when the
 user toggles a warehouse's status — never touches session_state directly.
+
+Marker/line styling follows the reference dualNetworkMap() function:
+- warehouses: folium.CustomIcon (image-based marker), colored by open/closed
+- stores: small semi-transparent folium.CircleMarker with popup + tooltip
+- flows: folium.PolyLine, width tiered by how many flow rows are being drawn
 """
 
-import streamlit as st
+from pathlib import Path
+
 import folium
-from folium.plugins import MarkerCluster
+import streamlit as st
 from streamlit_folium import st_folium
+
 from state import update_scenario, get_baseline_flows
 
-# Explicit tile URL + attribution instead of the "cartodbpositron" alias.
-# The alias resolves through folium's bundled xyzservices provider registry,
-# which has changed behavior across versions — using the raw tile URL
-# sidesteps that entirely and guarantees no API key is ever required.
+ASSETS_DIR = Path(__file__).parent.parent / "data/assets"
+ICON_OPEN = str(ASSETS_DIR / "warehouse_open.png")
+ICON_CLOSED = str(ASSETS_DIR / "warehouse_closed.png")
+
+# Explicit tile URL + attribution instead of the "cartodbpositron" alias —
+# sidesteps folium/xyzservices version differences in alias resolution.
 FREE_TILE_URL = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
 FREE_TILE_ATTR = (
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> '
     'contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
 )
+
+STORE_COLOR = "#0077CF"
+
+
+@st.cache_resource(show_spinner=False)
+def _build_map(_warehouses, _stores, _flows, open_wh_ids: tuple, flow_col: str, cache_key: str):
+    """
+    Builds the folium Map object. Cached on (open_wh_ids, cache_key) so
+    toggling warehouses or re-solving doesn't rebuild all ~400 store markers
+    on every Streamlit rerun — only when the actual inputs change.
+    Leading-underscore params (_warehouses, _stores, _flows) are excluded
+    from the cache key since DataFrames aren't hashable.
+    """
+    m = folium.Map(location=[51.0, 10.0], zoom_start=6, tiles=FREE_TILE_URL, attr=FREE_TILE_ATTR)
+
+    # tiered line width by flow volume — same approach as the reference function
+    # (fewer/wider lines are easier to read; many/thinner lines avoid clutter)
+    line_width = 1.2 if len(_flows) <= 500 else 0.6
+
+    # --- flows (drawn first, so markers sit on top) ---
+    if not _flows.empty:
+        wh_coord = _warehouses.set_index("wh_id")[["lat", "lon"]]
+        store_coord = _stores.set_index("store_id")[["lat", "lon"]]
+        for _, f in _flows.iterrows():
+            if f["wh_id"] not in wh_coord.index or f["store_id"] not in store_coord.index:
+                continue
+            folium.PolyLine(
+                locations=[wh_coord.loc[f["wh_id"]].tolist(), store_coord.loc[f["store_id"]].tolist()],
+                color="#F39C12", weight=line_width, opacity=0.6,
+                tooltip=f"{f['wh_id']} → {f['store_id']}: {f[flow_col]:.1f} pallets",
+            ).add_to(m)
+
+    # --- warehouses: CustomIcon, colored by open/closed ---
+    for _, wh in _warehouses.iterrows():
+        is_open = wh["wh_id"] in open_wh_ids
+        icon = folium.CustomIcon(ICON_OPEN if is_open else ICON_CLOSED, icon_size=(28, 28))
+        folium.Marker(
+            [wh["lat"], wh["lon"]],
+            tooltip=(f"{wh['wh_id']} — {wh['wh_name']} ({'open' if is_open else 'closed'})<br>"
+                     f"Capacity: {wh['capacity_pallets']:,} plt · "
+                     f"Fixed cost: €{wh['fixed_cost_eur_per_month']:,}/mo"),
+            icon=icon,
+        ).add_to(m)
+
+    # --- stores: small semi-transparent circle markers ---
+    for _, s in _stores.iterrows():
+        folium.CircleMarker(
+            location=[s["lat"], s["lon"]],
+            popup=folium.Popup(f"Store: {s['store_id']}<br>City: {s['city']}", max_width=300),
+            color=STORE_COLOR,
+            radius=3,          # reference used 0.05 (px), which is sub-pixel and effectively
+                                # invisible in-browser — bumped up so stores are actually visible
+            opacity=0.5,
+            tooltip=folium.map.Tooltip(f"Store ID: {s['store_id']}"),
+            fill=True,
+            fillOpacity=0.4,
+        ).add_to(m)
+
+    return m
 
 
 def render_map_tab():
@@ -43,59 +111,26 @@ def render_map_tab():
                 update_scenario({"wh_status": {wh["wh_id"]: "open" if new_val else "closed"}})
                 st.rerun()
 
-    # --- base map ---
-    m = folium.Map(location=[51.0, 10.0], zoom_start=6, tiles=FREE_TILE_URL, attr=FREE_TILE_ATTR)
-
-    # warehouses: individual markers (only 8, no need to cluster)
-    for _, wh in warehouses.iterrows():
-        is_open = scenario["wh_status"][wh["wh_id"]] == "open"
-        folium.Marker(
-            [wh["lat"], wh["lon"]],
-            tooltip=(f"{wh['wh_id']} — {wh['wh_name']} ({'open' if is_open else 'closed'})<br>"
-                     f"Capacity: {wh['capacity_pallets']:,} plt · "
-                     f"Fixed cost: €{wh['fixed_cost_eur_per_month']:,}/mo"),
-            icon=folium.Icon(color="green" if is_open else "gray", icon="warehouse", prefix="fa"),
-        ).add_to(m)
-
-    # stores: clustered — 400 individual markers would be unreadable and slow to render
-    store_cluster = MarkerCluster(name="Stores").add_to(m)
-    for _, s in stores.iterrows():
-        folium.CircleMarker(
-            [s["lat"], s["lon"]], radius=4, color="#3186cc", fill=True, fill_opacity=0.8,
-            tooltip=f"{s['store_id']} ({s['city']})",
-        ).add_to(store_cluster)
-
-    # --- flows: WH -> store ---
-    # Prefer actual solver output once solver.py is rewritten for the
-    # warehouse/store/pallet model; until then, fall back to the baseline
-    # (fixed-share) flow derived straight from delivery_baseline_share x demand.
+    # --- flows: prefer solved results once solver.py supports this schema; fall back to baseline ---
     if results and results.get("feasible"):
         flows = results["flows"]
         flow_col = "units" if "units" in flows.columns else "pallets"
+        cache_key = f"solved:{results.get('total_cost_eur', 0)}"
     else:
         flows = get_baseline_flows()
         flow_col = "pallets"
+        cache_key = "baseline"
 
-    if not flows.empty:
-        wh_coord = warehouses.set_index("wh_id")[["lat", "lon"]]
-        store_coord = stores.set_index("store_id")[["lat", "lon"]]
-        max_flow = flows[flow_col].max()
+    open_wh_ids = tuple(sorted(wh for wh, status in scenario["wh_status"].items() if status == "open"))
 
-        for _, f in flows.iterrows():
-            if f["wh_id"] not in wh_coord.index or f["store_id"] not in store_coord.index:
-                continue
-            weight = 0.5 + 2.5 * (f[flow_col] / max_flow)
-            folium.PolyLine(
-                [wh_coord.loc[f["wh_id"]].tolist(), store_coord.loc[f["store_id"]].tolist()],
-                weight=weight, opacity=0.35, color="#2980b9",
-                tooltip=f"{f['wh_id']} → {f['store_id']}: {f[flow_col]:.1f} pallets",
-            ).add_to(m)
-
+    m = _build_map(warehouses, stores, flows, open_wh_ids, flow_col, cache_key)
     st_folium(m, width=None, height=560, returned_objects=[])
 
     if results and results.get("feasible"):
-        st.caption("🔵 line = solved scenario flow · thickness ≈ pallet volume")
+        st.caption("🟧 line = solved scenario flow · 🟢/⚫ warehouse = open/closed · "
+                    "🔵 dot = store · line width ≈ flow density")
     else:
-        st.caption("🔵 line = baseline (fixed-share) flow, no scenario solved yet · "
-                    "thickness ≈ pallet volume · closing a warehouse drops its flows "
-                    "but doesn't yet reallocate them (pending solver update)")
+        st.caption("🟧 line = baseline (fixed-share) flow, no scenario solved yet · "
+                    "🟢/⚫ warehouse = open/closed · 🔵 dot = store · "
+                    "closing a warehouse drops its flows but doesn't yet reallocate them "
+                    "(pending solver update)")
