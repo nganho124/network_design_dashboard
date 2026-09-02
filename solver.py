@@ -27,6 +27,12 @@ fixed set of warehouses instead of leaving it fully open to the optimizer —
 see state.py's scenario docstring for the row shape and app.py/chat_assistant.py
 for how the chat sets it (e.g. "move Berlin's stores to Hamburg").
 
+A warehouse row with a NaN capacity_pallets is a GREENFIELD site (not yet
+built — see greenfield.py): it gets no hard capacity constraint, and instead
+of a sunk fixed_cost_eur_per_month, its cost is base_overhead_eur_per_month
+(flat) + capacity_rent_eur_per_pallet x whatever throughput the solver
+actually routes there — sized to demand rather than a pre-set capacity.
+
 solve_network() is a PURE function: (scenario, reference data) -> results.
 No Streamlit, no globals.
 """
@@ -85,9 +91,11 @@ def solve_network(scenario: dict,
     if not open_wh:
         return {"feasible": False, "reason": "No warehouses are open — every store would be unserved."}
 
-    total_capacity = warehouses[warehouses["wh_id"].isin(open_wh)]["capacity_pallets"].sum()
     total_demand = float(demand["demand_pallets"].sum())
-    if total_capacity < total_demand:
+    open_wh_rows = warehouses[warehouses["wh_id"].isin(open_wh)]
+    has_uncapped_wh = open_wh_rows["capacity_pallets"].isna().any()  # a greenfield site sizes to demand
+    total_capacity = open_wh_rows["capacity_pallets"].sum()  # NaN (greenfield) rows are skipped by .sum()
+    if not has_uncapped_wh and total_capacity < total_demand:
         return {"feasible": False,
                 "reason": f"Open warehouse capacity ({total_capacity:,.0f} plt) is below total "
                           f"demand ({total_demand:,.0f} plt) — open more warehouses."}
@@ -195,13 +203,18 @@ def solve_network(scenario: dict,
             for p in pins:
                 solver.Add(dist_flow[(p["wh_id"], store_id, group_id)] == qty * p["volume_share"])
 
-    # warehouse throughput capacity: outbound-to-store + outbound-transfer, which by flow
-    # balance (below) equals total inbound — this is what actually caps a consolidation
-    # hub's volume, not just what it ships directly to stores
+    # warehouse throughput: outbound-to-store + outbound-transfer, which by flow balance
+    # (below) equals total inbound — this is what actually caps a consolidation hub's
+    # volume, not just what it ships directly to stores. A greenfield site (NaN capacity)
+    # gets no cap here — its cost is charged against this same throughput in the
+    # objective instead (capacity_rent_eur_per_pallet), so it's sized to demand.
+    wh_throughput_terms = {}
     for wh_id in open_wh:
         cap = warehouses.loc[warehouses["wh_id"] == wh_id, "capacity_pallets"].iloc[0]
         transfer_out_terms = [var for (wf, _, _), var in transfer_flow.items() if wf == wh_id]
-        solver.Add(sum(dist_flow_by_wh[wh_id]) + sum(transfer_out_terms) <= cap)
+        wh_throughput_terms[wh_id] = dist_flow_by_wh[wh_id] + transfer_out_terms
+        if pd.notna(cap):
+            solver.Add(sum(wh_throughput_terms[wh_id]) <= cap)
 
     # flow balance per (wh, group): inbound + transfers-in == outbound-to-stores + transfers-out
     for wh_id in open_wh:
@@ -271,7 +284,23 @@ def solve_network(scenario: dict,
             if wf == wh_id:
                 cost_terms.append(h * var)
 
+    # greenfield sites (NaN fixed_cost_eur_per_month): rent scales with actual solved
+    # throughput, so — unlike the sunk fixed_cost_eur_per_month of an existing warehouse
+    # — this genuinely depends on routing decisions and must be part of the objective.
+    # The flat base_overhead_eur_per_month doesn't depend on any decision variable (the
+    # warehouse is already open, a fixed input here), so it's added to fixed_total
+    # afterwards instead of cluttering the objective with a no-op constant term.
+    has_rent_col = "capacity_rent_eur_per_pallet" in warehouses.columns
+    if has_rent_col:
+        capacity_rent = warehouses.set_index("wh_id")["capacity_rent_eur_per_pallet"].to_dict()
+        for wh_id in open_wh:
+            rent = capacity_rent.get(wh_id)
+            if pd.notna(rent):
+                cost_terms.append(rent * sum(wh_throughput_terms[wh_id]))
+
     fixed_total = warehouses[warehouses["wh_id"].isin(open_wh)]["fixed_cost_eur_per_month"].sum()
+    if "base_overhead_eur_per_month" in warehouses.columns:
+        fixed_total += warehouses[warehouses["wh_id"].isin(open_wh)]["base_overhead_eur_per_month"].sum()
 
     solver.Minimize(solver.Sum(cost_terms))
     status = solver.Solve()
@@ -332,6 +361,13 @@ def solve_network(scenario: dict,
     if not transfer_detail.empty:
         transfer_handling_rate = transfer_detail["wh_id_from"].map(handling_cost)
         handling_total += (transfer_detail["pallets"] * transfer_handling_rate).sum()
+
+    if has_rent_col:
+        for wh_id in open_wh:
+            rent = capacity_rent.get(wh_id)
+            if pd.notna(rent):
+                throughput = sum(var.solution_value() for var in wh_throughput_terms[wh_id])
+                fixed_total += rent * throughput
 
     total_pallets = flows_detail["pallets"].sum() if not flows_detail.empty else 0
     weighted_days = ((flows_detail["pallets"] * flows_detail["days_to_serve"]).sum() / total_pallets

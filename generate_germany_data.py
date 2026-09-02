@@ -141,6 +141,20 @@ REGIONAL_COST_INDEX = {
     "Cologne": 1.10, "Berlin": 1.00, "Nuremberg": 0.90, "Leipzig": 0.80,
 }
 
+# STATE-level equivalent of REGIONAL_COST_INDEX, covering every state a store or
+# candidate city can sit in — used to cost a brand-new ("greenfield") warehouse
+# at any city in CITY_DIRECTORY, since we don't have a hand-picked per-city index
+# for cities outside the original 8 warehouse hubs. Same illustrative basis: the
+# state containing each REGIONAL_COST_INDEX city is anchored close to that city's
+# value, other states interpolated by the same north/south, east/west pattern.
+STATE_COST_INDEX = {
+    "Bavaria": 1.30, "Baden-Württemberg": 1.25, "Hesse": 1.20, "Hamburg": 1.15,
+    "North Rhine-Westphalia": 1.10, "Berlin": 1.00, "Bremen": 0.95,
+    "Lower Saxony": 0.90, "Schleswig-Holstein": 0.90, "Rhineland-Palatinate": 0.90,
+    "Saarland": 0.85, "Saxony": 0.80, "Brandenburg": 0.78, "Thuringia": 0.78,
+    "Saxony-Anhalt": 0.75, "Mecklenburg-Vorpommern": 0.75,
+}
+
 # regional demand weighting: thin out the densely-packed Rhine-Ruhr area
 # around Cologne, boost Bavaria and Baden-Wuerttemberg
 COLOGNE_COORD = (50.9375, 6.9603)
@@ -229,6 +243,21 @@ def generate_warehouses() -> pd.DataFrame:
             "regional_cost_index": REGIONAL_COST_INDEX.get(city, 1.0),
         })
     return pd.DataFrame(rows)
+
+
+def generate_state_cost_index() -> pd.DataFrame:
+    return pd.DataFrame(sorted(STATE_COST_INDEX.items()), columns=["state", "regional_cost_index"])
+
+
+def generate_city_directory() -> pd.DataFrame:
+    """Every known city (lat/lon/state/population) — the pool a scenario can pick
+    from when adding a brand-new ("greenfield") warehouse at a city that isn't
+    already one of the WAREHOUSE_CITIES. See greenfield.py."""
+    return pd.DataFrame([
+        {"city": name, "lat": lat, "lon": lon, "population_k": pop,
+         "state": CITY_STATES.get(name, "Unknown State")}
+        for name, lat, lon, pop in GERMAN_CITIES
+    ])
 
 
 def _store_weight_multiplier(city_name: str, lat: float, lon: float) -> float:
@@ -580,6 +609,9 @@ def build_all_data(n_stores: int = 400, n_suppliers: int = 20):
     supply_share = generate_supply_share(suppliers, delivery_baseline_share, demand, supply_baseline_share)
     inbound_cost_tiers = compute_inbound_cost_tiers(suppliers, warehouses, inbound_cost)
     transfer_cost = compute_transfer_cost(warehouses)
+    warehouses["is_greenfield"] = False  # every warehouse generated here is an existing, already-built site
+    state_cost_index = generate_state_cost_index()
+    city_directory = generate_city_directory()
 
     return {
         "product_groups": product_groups,
@@ -594,6 +626,9 @@ def build_all_data(n_stores: int = 400, n_suppliers: int = 20):
         "supply_share": supply_share,
         "inbound_cost_tiers": inbound_cost_tiers,
         "transfer_cost": transfer_cost,
+        # scenario-facing "open a new warehouse anywhere" inputs — see greenfield.py
+        "state_cost_index": state_cost_index,
+        "city_directory": city_directory,
     }
 
 
@@ -647,6 +682,15 @@ if __name__ == "__main__":
     tc = data["transfer_cost"]
     print(f"transfer_cost rows: {len(tc)} (should be n_wh*(n_wh-1) = "
           f"{len(data['warehouses']) * (len(data['warehouses']) - 1)})")
+
+    sci = data["state_cost_index"]
+    print(f"state_cost_index rows: {len(sci)} (should cover all {data['stores']['state'].nunique()} "
+          f"states present in stores)")
+    missing_states = set(data["stores"]["state"]) - set(sci["state"])
+    print(f"Any store state missing from state_cost_index? {missing_states or 'no'}")
+
+    cd = data["city_directory"]
+    print(f"city_directory rows: {len(cd)} (candidate cities for a new warehouse)")
 
     print("\n--- Saving to reference data ---")
     db.init_storage()

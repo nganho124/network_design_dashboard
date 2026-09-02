@@ -29,6 +29,9 @@ REFERENCE_KEYS = [
     # scenario-facing sourcing/consolidation inputs (see solver.py) — distinct
     # from the fixed supply_baseline_share used for the "no action taken" view
     "supply_share", "inbound_cost_tiers", "transfer_cost",
+    # candidate-city pool + per-state cost basis for adding a brand-new ("greenfield")
+    # warehouse to a scenario — see greenfield.py
+    "city_directory", "state_cost_index",
 ]
 
 
@@ -47,6 +50,12 @@ def init_session_state():
             # it fully open to the solver. See update_scenario() for upsert/unpin rules
             # and solver.py's _resolve_forced_allocation() for how it's applied.
             "forced_allocation": [],
+            # list of {"wh_id", "wh_name", "city"} rows — brand-new, not-yet-built
+            # warehouses this scenario is testing (see greenfield.py). Scenario-only:
+            # never written to the reference parquet, regenerated on the fly each
+            # solve from city + state_cost_index. wh_status still governs open/closed
+            # for these ids exactly like any other warehouse.
+            "new_warehouses": [],
         }
         st.session_state.results = None        # solve_network() output, or a loaded saved scenario's
         st.session_state.chat_history = []      # populated once AI chat is added
@@ -65,6 +74,7 @@ def init_session_state():
         st.session_state.active_scenario_id = None  # scenario_id if `results` came from the library, else None (live/unsaved)
 
     st.session_state.scenario.setdefault("forced_allocation", [])  # ditto, for scenarios saved before this existed
+    st.session_state.scenario.setdefault("new_warehouses", [])
 
 
 def update_scenario(patch: dict):
@@ -80,6 +90,10 @@ def update_scenario(patch: dict):
     the pin without adding a new one. This lets a single patch also express a
     multi-warehouse split (e.g. 70%/30%) without the rows clobbering each other.
 
+    "new_warehouses" is upserted by wh_id the same way — a row with city=None
+    removes that greenfield warehouse (and you should also close it via
+    wh_status in the same patch, since removing it here doesn't do that).
+
     Any edit invalidates whatever `results` is currently loaded (a prior
     solve, or a scenario picked from the library) — it no longer corresponds
     to the edited scenario, so drop back to "live/unsaved" until re-solved.
@@ -90,12 +104,49 @@ def update_scenario(patch: dict):
             replaced_keys = {(row["store_id"], row["group_id"]) for row in value}
             current[:] = [row for row in current if (row["store_id"], row["group_id"]) not in replaced_keys]
             current.extend(row for row in value if row.get("wh_id") is not None)
+        elif key == "new_warehouses":
+            current = st.session_state.scenario.setdefault("new_warehouses", [])
+            replaced_ids = {row["wh_id"] for row in value}
+            current[:] = [row for row in current if row["wh_id"] not in replaced_ids]
+            current.extend(row for row in value if row.get("city") is not None)
         elif key in st.session_state.scenario and isinstance(value, dict):
             st.session_state.scenario[key].update(value)
         else:
             st.session_state.scenario[key] = value
     st.session_state.results = None
     st.session_state.active_scenario_id = None
+
+
+def next_new_warehouse_id(existing_ids: set) -> str:
+    """Next unused 'WHNxx' id, given every id already in use (existing warehouses
+    + already-added greenfield ones). Pure — shared by app.py's manual "Add
+    warehouse" form and chat_assistant.py's open_new_warehouse tool, so both
+    use the same numbering scheme."""
+    return next(f"WHN{i:02d}" for i in range(1, 100) if f"WHN{i:02d}" not in existing_ids)
+
+
+def get_effective_warehouses() -> "pd.DataFrame":
+    """
+    st.session_state.warehouses plus a row for each greenfield site in
+    scenario["new_warehouses"] — cheap (no distance-cost computation), for
+    anything that just needs warehouse rows: map markers, warehouse-status
+    toggles, dashboards. solve_network() needs the full delivery/inbound/
+    transfer cost tables too — see app.py's _effective_reference_tables(),
+    which builds this same combined warehouse set alongside those.
+    """
+    import pandas as pd
+    import greenfield
+
+    warehouses = st.session_state.warehouses
+    new_whs = st.session_state.scenario.get("new_warehouses", [])
+    if not new_whs:
+        return warehouses
+
+    rows = [greenfield.resolve_warehouse_row(
+        nw["city"], nw["wh_id"], nw["wh_name"],
+        city_directory=st.session_state.city_directory, state_cost_index=st.session_state.state_cost_index,
+    ) for nw in new_whs]
+    return pd.concat([warehouses, pd.DataFrame(rows)], ignore_index=True)
 
 
 def get_baseline_flows() -> "pd.DataFrame":

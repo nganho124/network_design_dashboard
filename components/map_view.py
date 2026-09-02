@@ -18,7 +18,7 @@ import folium
 import streamlit as st
 from streamlit_folium import st_folium
 
-from state import update_scenario, get_baseline_flows
+from state import update_scenario, get_baseline_flows, get_effective_warehouses
 
 ASSETS_DIR = Path(__file__).parent.parent / "data/assets"
 ICON_OPEN = str(ASSETS_DIR / "warehouse_open.png")
@@ -67,11 +67,17 @@ def _build_map(_warehouses, _stores, _flows, open_wh_ids: tuple, flow_col: str, 
     for _, wh in _warehouses.iterrows():
         is_open = wh["wh_id"] in open_wh_ids
         icon = folium.CustomIcon(ICON_OPEN if is_open else ICON_CLOSED, icon_size=(28, 28))
+        is_greenfield = bool(wh.get("is_greenfield", False))
+        if is_greenfield:
+            # no pre-set capacity/fixed cost — sized to whatever the solver actually routes there
+            size_note = "Capacity: sized to solved throughput (not yet built)"
+        else:
+            size_note = (f"Capacity: {wh['capacity_pallets']:,.0f} plt · "
+                         f"Fixed cost: €{wh['fixed_cost_eur_per_month']:,.0f}/mo")
+        name_note = f"{wh['wh_name']} 🏗️" if is_greenfield else wh["wh_name"]
         folium.Marker(
             [wh["lat"], wh["lon"]],
-            tooltip=(f"{wh['wh_id']} — {wh['wh_name']} ({'open' if is_open else 'closed'})<br>"
-                     f"Capacity: {wh['capacity_pallets']:,} plt · "
-                     f"Fixed cost: €{wh['fixed_cost_eur_per_month']:,}/mo"),
+            tooltip=(f"{wh['wh_id']} — {name_note} ({'open' if is_open else 'closed'})<br>{size_note}"),
             icon=icon,
         ).add_to(m)
 
@@ -95,7 +101,7 @@ def _build_map(_warehouses, _stores, _flows, open_wh_ids: tuple, flow_col: str, 
 def render_map_tab():
     st.subheader("Supply Chain Network")
 
-    warehouses = st.session_state.warehouses
+    warehouses = get_effective_warehouses()  # includes any greenfield sites added to this scenario
     stores = st.session_state.stores
     scenario = st.session_state.scenario
     results = st.session_state.results
@@ -105,7 +111,7 @@ def render_map_tab():
         cols = st.columns(4)
         for i, (_, wh) in enumerate(warehouses.iterrows()):
             is_open = scenario["wh_status"][wh["wh_id"]] == "open"
-            label = f"{wh['wh_id']} — {wh['wh_name']}"
+            label = f"{wh['wh_id']} — {wh['wh_name']}" + (" 🏗️" if wh.get("is_greenfield") else "")
             new_val = cols[i % 4].checkbox(label, value=is_open, key=f"wh_toggle_{wh['wh_id']}")
             if new_val != is_open:
                 update_scenario({"wh_status": {wh["wh_id"]: "open" if new_val else "closed"}})
