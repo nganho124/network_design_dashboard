@@ -464,6 +464,108 @@ def generate_delivery_baseline_share(stores: pd.DataFrame, warehouses: pd.DataFr
     return pd.DataFrame(rows)
 
 
+def generate_supply_share(suppliers: pd.DataFrame, delivery_baseline_share: pd.DataFrame,
+                           demand: pd.DataFrame, supply_baseline_share: pd.DataFrame,
+                           extra_suppliers_per_group: int = 2,
+                           extra_share_total: float = 0.08) -> pd.DataFrame:
+    """Scenario-facing sourcing eligibility: each supplier's share of a product
+    group's TOTAL network volume (Supplier x Group, no wh_id) — used by the
+    solver as a network-wide sourcing cap when testing open/close scenarios,
+    instead of the fixed per-warehouse supply_baseline_share split.
+
+    Derived from the baseline mix, then "widened": a couple of eligible-but-
+    unused suppliers per group are added with a modest share, mirroring how a
+    real Approved Supplier List is broader than what's actually flowing today
+    — without that, a what-if scenario would have no real sourcing flexibility
+    to explore beyond what's already used in the baseline."""
+    wg = delivery_baseline_share.merge(demand, on=["store_id", "group_id"])
+    wg["pallets"] = wg["volume_share"] * wg["demand_pallets"]
+    wh_group_volume = wg.groupby(["wh_id", "group_id"])["pallets"].sum().rename("wh_group_pallets").reset_index()
+
+    merged = supply_baseline_share.merge(wh_group_volume, on=["wh_id", "group_id"])
+    merged["weighted_pallets"] = merged["volume_share"] * merged["wh_group_pallets"]
+    supplier_group_pallets = merged.groupby(["supplier_id", "group_id"])["weighted_pallets"].sum()
+
+    rows = []
+    for group_id, pallets in supplier_group_pallets.groupby(level="group_id"):
+        pallets = pallets.droplevel("group_id")
+        base_share = pallets / pallets.sum()
+
+        candidates = suppliers[~suppliers["supplier_id"].isin(base_share.index)]
+        n_extra = min(extra_suppliers_per_group, len(candidates))
+        combined = base_share * (1 - extra_share_total)
+
+        if n_extra > 0:
+            weights = candidates["volume_share"].to_numpy()
+            weights = weights / weights.sum()
+            chosen_idx = RNG.choice(len(candidates), size=n_extra, replace=False, p=weights)
+            chosen_ids = candidates.iloc[chosen_idx]["supplier_id"].tolist()
+            extra_shares = RNG.dirichlet(np.ones(n_extra)) * extra_share_total
+            for sid, share in zip(chosen_ids, extra_shares):
+                combined[sid] = share
+        else:
+            combined = combined / combined.sum()  # no room to widen, renormalize back to 1.0
+
+        for supplier_id, share in combined.items():
+            rows.append({"supplier_id": supplier_id, "group_id": group_id, "volume_share": round(float(share), 4)})
+
+    return pd.DataFrame(rows)
+
+
+# stepped import pricing: (min_pallets, max_pallets) per tier, and a cost
+# multiplier relative to the flat international rate in inbound_cost —
+# models consolidation savings (LCL vs FCL-style container economics)
+INBOUND_TIERS = [
+    {"tier_id": 1, "min_pallets": 0, "max_pallets": 19, "multiplier": 1.35},
+    {"tier_id": 2, "min_pallets": 20, "max_pallets": 39, "multiplier": 1.00},
+    {"tier_id": 3, "min_pallets": 40, "max_pallets": None, "multiplier": 0.75},
+]
+
+
+def compute_inbound_cost_tiers(suppliers: pd.DataFrame, warehouses: pd.DataFrame,
+                                inbound_cost: pd.DataFrame) -> pd.DataFrame:
+    """Stepped per-pallet import cost, INTERNATIONAL suppliers only — small
+    shipments pay a premium, large ones get a volume discount, so a scenario
+    that consolidates import volume onto fewer (supplier, WH) shipments and
+    redistributes via internal transfer can trade a cheaper import rate
+    against transfer_cost + extra handling. Domestic suppliers keep the flat
+    inbound_cost rate — short-haul trucking doesn't have the same step
+    economics as ocean freight/customs consolidation."""
+    intl = suppliers[suppliers["type"] == "international"]
+    flat_rate = inbound_cost.set_index(["supplier_id", "wh_id"])["cost_per_pallet_eur"]
+
+    rows = []
+    for _, sup in intl.iterrows():
+        for _, wh in warehouses.iterrows():
+            base_rate = flat_rate.get((sup["supplier_id"], wh["wh_id"]))
+            for tier in INBOUND_TIERS:
+                rows.append({
+                    "supplier_id": sup["supplier_id"], "wh_id": wh["wh_id"], "tier_id": tier["tier_id"],
+                    "min_pallets": tier["min_pallets"], "max_pallets": tier["max_pallets"],
+                    "cost_per_pallet_eur": round(base_rate * tier["multiplier"], 2),
+                })
+    return pd.DataFrame(rows)
+
+
+def compute_transfer_cost(warehouses: pd.DataFrame, rate_eur_per_km_pallet: float = 0.10,
+                           base_fee_eur: float = 8.0) -> pd.DataFrame:
+    """WH -> WH internal transfer cost (inter-hub trucking), used when a
+    scenario consolidates import volume at one WH and redistributes it to
+    others rather than importing directly into each."""
+    rows = []
+    for _, a in warehouses.iterrows():
+        for _, b in warehouses.iterrows():
+            if a["wh_id"] == b["wh_id"]:
+                continue
+            dist_km = _haversine(a["lat"], a["lon"], b["lat"], b["lon"])
+            cost = base_fee_eur + rate_eur_per_km_pallet * dist_km
+            days = round(dist_km / 550 + 0.3, 2)
+            rows.append({"wh_id_from": a["wh_id"], "wh_id_to": b["wh_id"],
+                        "distance_km": round(dist_km, 1), "cost_per_pallet_eur": round(cost, 2),
+                        "days": days})
+    return pd.DataFrame(rows)
+
+
 def build_all_data(n_stores: int = 400, n_suppliers: int = 20):
     product_groups = generate_product_groups()
     warehouses = generate_warehouses()
@@ -475,6 +577,9 @@ def build_all_data(n_stores: int = 400, n_suppliers: int = 20):
     delivery_cost = compute_delivery_cost(warehouses, stores)
     supply_baseline_share = generate_supply_baseline_share(suppliers, product_groups, warehouses, inbound_cost)
     delivery_baseline_share = generate_delivery_baseline_share(stores, warehouses, product_groups)
+    supply_share = generate_supply_share(suppliers, delivery_baseline_share, demand, supply_baseline_share)
+    inbound_cost_tiers = compute_inbound_cost_tiers(suppliers, warehouses, inbound_cost)
+    transfer_cost = compute_transfer_cost(warehouses)
 
     return {
         "product_groups": product_groups,
@@ -486,6 +591,9 @@ def build_all_data(n_stores: int = 400, n_suppliers: int = 20):
         "delivery_cost": delivery_cost,
         "supply_baseline_share": supply_baseline_share,
         "delivery_baseline_share": delivery_baseline_share,
+        "supply_share": supply_share,
+        "inbound_cost_tiers": inbound_cost_tiers,
+        "transfer_cost": transfer_cost,
     }
 
 
@@ -524,6 +632,21 @@ if __name__ == "__main__":
     dbs = data["delivery_baseline_share"]
     check2 = dbs.groupby(["store_id", "group_id"])["volume_share"].sum().round(3)
     print(f"delivery_baseline_share sums to 1.0 per (store,group)? {(check2 == 1.0).all()}")
+
+    ss = data["supply_share"]
+    check3 = ss.groupby("group_id")["volume_share"].sum().round(3)
+    print(f"supply_share sums to 1.0 per group? {(check3 == 1.0).all()}")
+    avg_suppliers_per_group = ss.groupby("group_id")["supplier_id"].nunique().mean()
+    print(f"Avg eligible suppliers per group in supply_share: {avg_suppliers_per_group:.1f} "
+          f"(vs {sbs.groupby('group_id')['supplier_id'].nunique().mean():.1f} used across baseline WH mix)")
+
+    ict = data["inbound_cost_tiers"]
+    print(f"inbound_cost_tiers rows: {len(ict)} "
+          f"({ict['supplier_id'].nunique()} intl suppliers x {ict['wh_id'].nunique()} WH x 3 tiers)")
+
+    tc = data["transfer_cost"]
+    print(f"transfer_cost rows: {len(tc)} (should be n_wh*(n_wh-1) = "
+          f"{len(data['warehouses']) * (len(data['warehouses']) - 1)})")
 
     print("\n--- Saving to reference data ---")
     db.init_storage()

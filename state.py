@@ -2,10 +2,12 @@
 Scenario schema + session_state helpers.
 
 This is the ONE data contract every part of the app reads/writes through:
-- map_view.py reads scenario + reference data (+ results, once solver.py
-  is rewritten) to draw the network
-- dashboard_view.py reads results to draw charts (still on the OLD schema —
-  not yet updated for the warehouse/store/pallet model, see solver.py note)
+- map_view.py reads scenario + reference data + results (solver.py output,
+  or a scenario loaded from the library) to draw the network
+- dashboard_view.py reads results to draw charts (still on its own fixed-share
+  approximation, not yet wired to solve_network() — see helper_calculation.py)
+- app.py's scenario library sidebar solves/saves scenarios and lets you pick
+  a saved one, writing scenario + results back through this module
 - (hackathon night) the AI chat writes updates into scenario via update_scenario()
 
 Reference data (warehouses, stores, demand, suppliers, cost curves, baseline
@@ -17,28 +19,44 @@ already on disk.
 import streamlit as st
 import db
 
+# every table db.load_reference_data() must supply — kept as one list so a browser
+# tab that's been open since before a table existed can self-heal (see below)
+# instead of crashing with "st.session_state has no attribute ...".
+REFERENCE_KEYS = [
+    "warehouses", "stores", "demand", "product_groups", "suppliers",
+    "inbound_cost", "delivery_cost", "supply_baseline_share", "delivery_baseline_share",
+    # scenario-facing sourcing/consolidation inputs (see solver.py) — distinct
+    # from the fixed supply_baseline_share used for the "no action taken" view
+    "supply_share", "inbound_cost_tiers", "transfer_cost",
+]
+
 
 def init_session_state():
     """Call once at the top of app.py"""
     if "scenario" not in st.session_state:
         ref = db.load_reference_data()
-
-        st.session_state.warehouses = ref["warehouses"]
-        st.session_state.stores = ref["stores"]
-        st.session_state.demand = ref["demand"]
-        st.session_state.product_groups = ref["product_groups"]
-        st.session_state.suppliers = ref["suppliers"]
-        st.session_state.inbound_cost = ref["inbound_cost"]
-        st.session_state.delivery_cost = ref["delivery_cost"]
-        st.session_state.supply_baseline_share = ref["supply_baseline_share"]
-        st.session_state.delivery_baseline_share = ref["delivery_baseline_share"]
+        for key in REFERENCE_KEYS:
+            st.session_state[key] = ref[key]
 
         st.session_state.scenario = {
             # dict: wh_id -> "open" | "closed"
             "wh_status": {wh_id: "open" for wh_id in ref["warehouses"]["wh_id"]},
         }
-        st.session_state.results = None        # filled in once solver.py is rewritten for this schema
+        st.session_state.results = None        # solve_network() output, or a loaded saved scenario's
         st.session_state.chat_history = []      # populated once AI chat is added
+
+    # keys added after the initial release: a browser tab already open when one of
+    # these was introduced has "scenario" in session_state already, so the block
+    # above is skipped and the key would otherwise never get set — self-heal here
+    # instead of crashing on next rerun.
+    missing_ref_keys = [k for k in REFERENCE_KEYS if k not in st.session_state]
+    if missing_ref_keys:
+        ref = db.load_reference_data()
+        for key in missing_ref_keys:
+            st.session_state[key] = ref[key]
+
+    if "active_scenario_id" not in st.session_state:
+        st.session_state.active_scenario_id = None  # scenario_id if `results` came from the library, else None (live/unsaved)
 
 
 def update_scenario(patch: dict):
@@ -47,12 +65,18 @@ def update_scenario(patch: dict):
     This is the single entry point both manual UI controls AND
     the future AI chat parser should call — never mutate
     st.session_state.scenario directly from elsewhere.
+
+    Any edit invalidates whatever `results` is currently loaded (a prior
+    solve, or a scenario picked from the library) — it no longer corresponds
+    to the edited scenario, so drop back to "live/unsaved" until re-solved.
     """
     for key, value in patch.items():
         if key in st.session_state.scenario and isinstance(value, dict):
             st.session_state.scenario[key].update(value)
         else:
             st.session_state.scenario[key] = value
+    st.session_state.results = None
+    st.session_state.active_scenario_id = None
 
 
 def get_scenario_schema_for_llm() -> dict:
@@ -74,11 +98,9 @@ def get_baseline_flows() -> "pd.DataFrame":
     This is a STAND-IN for solver output: it shows what the baseline (fixed
     share) network looks like, and reacts to opening/closing a warehouse by
     dropping that warehouse's flows — but it does NOT reallocate a closed
-    warehouse's demand to another one (that requires solver.py, which still
-    targets the old DC/region schema and hasn't been rewritten for the
-    warehouse/store/pallet model yet). Once solver.py is updated, map_view.py
-    should prefer st.session_state.results over this function whenever a
-    scenario has actually been solved.
+    warehouse's demand to another one. map_view.py prefers
+    st.session_state.results (solve_network() output, or a loaded saved
+    scenario) over this function whenever a scenario has actually been solved.
     """
     dbs = st.session_state.delivery_baseline_share
     demand = st.session_state.demand

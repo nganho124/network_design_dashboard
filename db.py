@@ -2,9 +2,10 @@
 Persistence layer.
 
 - Reference/static data (warehouses, stores, suppliers, product_groups,
-  demand, supply_share, inbound_cost, delivery_cost) -> Parquet files under
-  data/reference/. This is "today's known world" — generated once per
-  industry choice, rarely touched after that.
+  demand, supply_baseline_share, delivery_baseline_share, supply_share,
+  inbound_cost, inbound_cost_tiers, delivery_cost, transfer_cost) ->
+  Parquet files under data/reference/. This is "today's known world" —
+  generated once per industry choice, rarely touched after that.
 
 - Scenario data (each what-if test: which WHs are open, delivery mode,
   resulting cost/service metrics, and the detailed flow table) -> SQLite
@@ -48,9 +49,7 @@ def init_storage():
             scenario_id TEXT,
             wh_id TEXT,
             store_id TEXT,
-            group_id TEXT,
-            units REAL,
-            mode TEXT,
+            pallets REAL,
             FOREIGN KEY(scenario_id) REFERENCES scenarios(scenario_id)
         )
     """)
@@ -66,8 +65,8 @@ def save_reference_data(data: dict):
     """data: dict of {table_name: DataFrame}, e.g. output of build_all_data().
 
     Full replace: clears any existing .parquet files first, so a table that
-    was renamed or removed (e.g. old supply_share -> supply_baseline_share)
-    doesn't linger as a stale file alongside the new ones.
+    was renamed or removed doesn't linger as a stale file alongside the new
+    ones.
     """
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
     for stale in REFERENCE_DIR.glob("*.parquet"):
@@ -86,6 +85,10 @@ def load_reference_data() -> dict:
 
 def save_scenario(name: str, scenario_patch: dict, results: dict,
                    description: str = "", source: str = "manual") -> str:
+    """results: solve_network() output. Only the aggregated wh_id/store_id/pallets
+    "flows" table is persisted (what map_view.py needs to redraw the network) —
+    the richer per-group/sourcing/transfer breakdown isn't kept across a save/load
+    round trip."""
     scenario_id = str(uuid.uuid4())[:8]
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -98,8 +101,7 @@ def save_scenario(name: str, scenario_patch: dict, results: dict,
     if results.get("feasible") and flows is not None and not flows.empty:
         flows = flows.copy()
         flows["scenario_id"] = scenario_id
-        keep_cols = [c for c in ["scenario_id", "wh_id", "store_id", "group_id", "units", "mode"]
-                     if c in flows.columns]
+        keep_cols = [c for c in ["scenario_id", "wh_id", "store_id", "pallets"] if c in flows.columns]
         flows[keep_cols].to_sql("scenario_flows", conn, if_exists="append", index=False)
     conn.commit()
     conn.close()

@@ -13,8 +13,7 @@ def calculate_dashboard_metrics(open_wh_ids):
     warehouses = st.session_state.warehouses
     stores = st.session_state.stores
     suppliers = st.session_state.suppliers
-    product_groups = st.session_state.product_groups
-    
+
     # 1. OUTBOUND / DELIVERY COST
     active_del_share = del_share[del_share["wh_id"].isin(open_wh_ids)]
     outbound = demand.merge(active_del_share, on=["store_id", "group_id"])
@@ -49,11 +48,9 @@ def calculate_dashboard_metrics(open_wh_ids):
     inbound_flows = inbound.merge(suppliers[['supplier_id', 'type']], on='supplier_id')
     inbound_flows['supplier_group'] = inbound_flows['type'].str.capitalize() + " Suppliers"
     inbound_flows = inbound_flows.merge(warehouses[['wh_id', 'wh_name']], on='wh_id')
-    inbound_flows = inbound_flows.merge(product_groups[['group_id', 'category']], on='group_id')
-    
+
     outbound_flows = outbound.merge(warehouses[['wh_id', 'wh_name']], on='wh_id')
     outbound_flows = outbound_flows.merge(stores[['store_id', 'state']], on='store_id')
-    outbound_flows = outbound_flows.merge(product_groups[['group_id', 'category']], on='group_id')
 
     total_cost = total_inbound_cost + total_handling_cost + total_fixed_cost + total_outbound_cost
     unit_cost = total_cost / total_outbound_vol if total_outbound_vol > 0 else 0
