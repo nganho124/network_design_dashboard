@@ -1,0 +1,30 @@
+/* Sidebar width and layout adjustments */
+section[data-testid="stSidebar"] {
+    width: 350px !important; 
+}
+
+div[data-testid="stSidebarUserContent"] {
+    padding-top: 0rem;
+}
+
+/* Sidebar background color */
+[data-testid="stSidebar"] {
+    background-color: #FF9292;
+}
+
+/* Sidebar text and markdown styling */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {
+    color: white;
+    font-weight: bold;
+}
+
+/* Sidebar expander icons */
+[data-testid="stSidebar"] [data-testid="stExpanderToggleIcon"] {
+    color: white;
+}
+
+/* Sidebar collapse button */
+[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] {
+    z-index: 99999;
+    color: white;
+}

@@ -13,6 +13,8 @@ from components.dashboard_view import render_dashboard_tab
 st.set_page_config(page_title="AI Supply Chain Network Advisor", layout="wide")
 
 init_session_state()
+with open("styles.css") as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
 
 def chat_placeholder():

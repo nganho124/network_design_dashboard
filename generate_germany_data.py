@@ -84,6 +84,42 @@ GERMAN_CITIES = [
     ("Lippstadt", 51.6739, 8.3486, 68), ("Rheine", 52.2833, 7.4394, 77),
     ("Dorsten", 51.6608, 6.9647, 74),
 ]
+
+# Map every candidate city to its respective German state
+CITY_STATES = {
+    "Hamburg": "Hamburg", "Berlin": "Berlin", "Munich": "Bavaria", "Cologne": "North Rhine-Westphalia",
+    "Frankfurt": "Hesse", "Stuttgart": "Baden-Württemberg", "Leipzig": "Saxony", "Nuremberg": "Bavaria",
+    "Dortmund": "North Rhine-Westphalia", "Essen": "North Rhine-Westphalia", "Dresden": "Saxony",
+    "Hannover": "Lower Saxony", "Bremen": "Bremen", "Duisburg": "North Rhine-Westphalia",
+    "Bochum": "North Rhine-Westphalia", "Wuppertal": "North Rhine-Westphalia",
+    "Bielefeld": "North Rhine-Westphalia", "Bonn": "North Rhine-Westphalia", "Mannheim": "Baden-Württemberg",
+    "Karlsruhe": "Baden-Württemberg", "Wiesbaden": "Hesse", "Muenster": "North Rhine-Westphalia",
+    "Augsburg": "Bavaria", "Aachen": "North Rhine-Westphalia", "Moenchengladbach": "North Rhine-Westphalia",
+    "Braunschweig": "Lower Saxony", "Chemnitz": "Saxony", "Kiel": "Schleswig-Holstein",
+    "Halle": "Saxony-Anhalt", "Magdeburg": "Saxony-Anhalt", "Freiburg": "Baden-Württemberg",
+    "Krefeld": "North Rhine-Westphalia", "Luebeck": "Schleswig-Holstein", "Oberhausen": "North Rhine-Westphalia",
+    "Erfurt": "Thuringia", "Mainz": "Rhineland-Palatinate", "Rostock": "Mecklenburg-Vorpommern",
+    "Kassel": "Hesse", "Saarbruecken": "Saarland", "Potsdam": "Brandenburg", "Herne": "North Rhine-Westphalia", 
+    "Neuss": "North Rhine-Westphalia", "Paderborn": "North Rhine-Westphalia", "Regensburg": "Bavaria", 
+    "Ingolstadt": "Bavaria", "Wuerzburg": "Bavaria", "Fuerth": "Bavaria", "Wolfsburg": "Lower Saxony", 
+    "Offenbach": "Hesse", "Ulm": "Baden-Württemberg", "Heidelberg": "Baden-Württemberg", 
+    "Pforzheim": "Baden-Württemberg", "Goettingen": "Lower Saxony", "Bottrop": "North Rhine-Westphalia", 
+    "Trier": "Rhineland-Palatinate", "Recklinghausen": "North Rhine-Westphalia", "Reutlingen": "Baden-Württemberg", 
+    "Bremerhaven": "Bremen", "Koblenz": "Rhineland-Palatinate", "Bergisch Gladbach": "North Rhine-Westphalia", 
+    "Jena": "Thuringia", "Remscheid": "North Rhine-Westphalia", "Erlangen": "Bavaria", "Moers": "North Rhine-Westphalia", 
+    "Salzgitter": "Lower Saxony", "Siegen": "North Rhine-Westphalia", "Hildesheim": "Lower Saxony", 
+    "Cottbus": "Brandenburg", "Kaiserslautern": "Rhineland-Palatinate", "Guetersloh": "North Rhine-Westphalia", 
+    "Witten": "North Rhine-Westphalia", "Iserlohn": "North Rhine-Westphalia", "Ratingen": "North Rhine-Westphalia", 
+    "Hanau": "Hesse", "Zwickau": "Saxony", "Flensburg": "Schleswig-Holstein", "Schwerin": "Mecklenburg-Vorpommern",
+    "Luenen": "North Rhine-Westphalia", "Villingen-Schwenningen": "Baden-Württemberg", "Konstanz": "Baden-Württemberg",
+    "Worms": "Rhineland-Palatinate", "Marburg": "Hesse", "Neubrandenburg": "Mecklenburg-Vorpommern",
+    "Detmold": "North Rhine-Westphalia", "Giessen": "Hesse", "Ludwigshafen": "Rhineland-Palatinate",
+    "Offenburg": "Baden-Württemberg", "Ravensburg": "Baden-Württemberg", "Neumuenster": "Schleswig-Holstein",
+    "Landshut": "Bavaria", "Celle": "Lower Saxony", "Delmenhorst": "Lower Saxony",
+    "Lippstadt": "North Rhine-Westphalia", "Rheine": "North Rhine-Westphalia", "Dorsten": "North Rhine-Westphalia"
+}
+
+
 # dedupe defensive (in case of accidental repeats above)
 _seen = set()
 GERMAN_CITIES = [c for c in GERMAN_CITIES if not (c[0] in _seen or _seen.add(c[0]))]
@@ -220,11 +256,15 @@ def generate_stores(product_groups: pd.DataFrame, n_stores: int = 400):
     demand_rows = []
     for i, city_idx in enumerate(idx, start=1):
         name, lat, lon, pop = GERMAN_CITIES[city_idx]
+        state = CITY_STATES.get(name, "Unknown State") # Add state lookup here
+        
         jlat, jlon = lat + RNG.uniform(-0.05, 0.05), lon + RNG.uniform(-0.05, 0.05)
         store_id = f"ST_{i:03d}_{name.upper()}"
-        stores.append({"store_id": store_id, "city": name, "lat": jlat, "lon": jlon})
+        
+        # Add the state to the stores dictionary
+        stores.append({"store_id": store_id, "city": name, "state": state, "lat": jlat, "lon": jlon})
 
-        base_demand = pop * RNG.uniform(0.45, 0.8)  # monthly pallet-demand base, scaled from population
+        base_demand = pop * RNG.uniform(0.45, 0.8)  
         for _, pg in product_groups.iterrows():
             demand_rows.append({
                 "store_id": store_id, "group_id": pg["group_id"],
