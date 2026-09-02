@@ -9,7 +9,7 @@ div[data-testid="stSidebarUserContent"] {
 
 /* Sidebar background color */
 [data-testid="stSidebar"] {
-    background-color: #FF9292;
+    background-color: #BA5A5A;
 }
 
 /* Sidebar text and markdown styling */

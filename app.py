@@ -2,16 +2,17 @@
 AI Supply Chain Network Advisor — main entry point.
 
 Layout: 2 tabs (Map / Dashboard) + a sidebar for scenario management
-(solve / save / pick a saved scenario) and the AI chat (added at the
-hackathon — see chat_placeholder() below).
+(solve / save / pick a saved scenario, and a natural-language chat that
+does the same thing via Claude tool use — see scenario_chat_sidebar()).
 """
 
 import pandas as pd
 import streamlit as st
 
+import chat_assistant
 import db
 from solver import solve_network
-from state import init_session_state
+from state import init_session_state, update_scenario
 from components.map_view import render_map_tab
 from components.dashboard_view import render_dashboard_tab
 
@@ -24,23 +25,62 @@ with open("styles.css") as f:
 LIVE_OPTION = "__live__"  # sentinel for "current, unsaved edits" in the scenario picker
 
 
-def chat_placeholder():
+def _format_patch_summary(patch: dict, warehouses_df) -> str:
+    wh_names = warehouses_df.set_index("wh_id")["wh_name"].to_dict()
+    changes = patch.get("wh_status", {})
+    return ", ".join(f"{wh_names.get(wh, wh)} → {status}" for wh, status in changes.items())
+
+
+def scenario_chat_sidebar():
     """
-    Sidebar slot for the AI chat — build this out at the hackathon.
+    Natural-language alternative to toggling warehouses by hand: describe a
+    change (e.g. "close the Hamburg warehouse"), Claude proposes a scenario
+    patch via tool use (chat_assistant.interpret_message), we apply it with
+    update_scenario() and — if "Auto-solve" is on — solve it immediately.
 
-    The integration is intentionally small:
-      1. Send user message + current scenario + get_scenario_schema_for_llm()
-         to Claude with tool-use enabled.
-      2. Claude returns a tool call with a partial scenario patch.
-      3. Call update_scenario(patch) then solve_network() (see
-         scenario_library_sidebar()'s "Solve" button for the call shape).
-      4. st.rerun()
-
-    That's it — no other file needs to change.
+    Claude never gets to claim a result itself; the message shown to the user
+    is always built from the actual update_scenario()/solve_network() outcome.
     """
     st.sidebar.subheader("💬 Scenario Assistant")
-    st.sidebar.caption("Coming at the build night — describe a scenario in plain language.")
-    st.sidebar.text_input("e.g. 'Close WH004 Cologne'", disabled=True)
+    auto_solve = st.sidebar.checkbox(
+        "Auto-solve after each change", value=False,
+        help="Off: the chat only stages the change — review it and click 'Solve current "
+             "scenario' yourself. On: it solves immediately after applying it (~15-20s).")
+
+    for msg in st.session_state.chat_history:
+        with st.sidebar.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_msg = st.sidebar.chat_input("e.g. 'Close WH004 Cologne'")
+    if not user_msg:
+        return
+
+    st.session_state.chat_history.append({"role": "user", "content": user_msg})
+    result = chat_assistant.interpret_message(
+        user_msg, st.session_state.chat_history[:-1],
+        st.session_state.warehouses, st.session_state.scenario["wh_status"],
+    )
+
+    if result["error"]:
+        reply = f"⚠️ {result['error']}"
+    else:
+        reply_parts = [result["reply"]] if result["reply"] else []
+        if result["patch"]:
+            update_scenario(result["patch"])
+            reply_parts.append(f"Applied: {_format_patch_summary(result['patch'], st.session_state.warehouses)}.")
+            if auto_solve:
+                _solve_current_scenario()
+                res = st.session_state.results
+                if res.get("feasible"):
+                    reply_parts.append(f"✅ Solved — total cost €{res['total_cost_eur']:,.0f}/mo.")
+                else:
+                    reply_parts.append(f"⚠️ Infeasible: {res.get('reason', 'no feasible solution.')}")
+            else:
+                reply_parts.append("Click **▶️ Solve current scenario** below to run it.")
+        reply = " ".join(reply_parts) if reply_parts else "Sorry, I didn't catch a scenario change in that — could you rephrase?"
+
+    st.session_state.chat_history.append({"role": "assistant", "content": reply})
+    st.rerun()
 
 
 def _solve_current_scenario():
@@ -142,7 +182,7 @@ def main():
     st.title("🚚 AI Supply Chain Network Advisor")
     st.caption("Test different network setups before committing to a real restructuring decision.")
 
-    chat_placeholder()
+    scenario_chat_sidebar()
     scenario_library_sidebar()
 
     with st.sidebar:

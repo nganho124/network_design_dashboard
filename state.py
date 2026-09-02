@@ -8,7 +8,8 @@ This is the ONE data contract every part of the app reads/writes through:
   approximation, not yet wired to solve_network() — see helper_calculation.py)
 - app.py's scenario library sidebar solves/saves scenarios and lets you pick
   a saved one, writing scenario + results back through this module
-- (hackathon night) the AI chat writes updates into scenario via update_scenario()
+- app.py's scenario chat (chat_assistant.py) writes updates into scenario via
+  update_scenario() too, same as the manual warehouse toggles
 
 Reference data (warehouses, stores, demand, suppliers, cost curves, baseline
 shares) comes from db.load_reference_data() — the parquet files produced by
@@ -77,17 +78,6 @@ def update_scenario(patch: dict):
             st.session_state.scenario[key] = value
     st.session_state.results = None
     st.session_state.active_scenario_id = None
-
-
-def get_scenario_schema_for_llm() -> dict:
-    """
-    Human/LLM-readable description of the scenario shape.
-    Reuse this directly as (or to build) the Claude tool-use input_schema
-    on hackathon night — keep it in sync with the dict above.
-    """
-    return {
-        "wh_status": "object mapping wh_id (e.g. 'WH001') -> 'open' or 'closed'",
-    }
 
 
 def get_baseline_flows() -> "pd.DataFrame":
