@@ -41,7 +41,7 @@ def render_dashboard_tab():
     # ==========================================
     # 1. KPI SECTION
     # ==========================================
-    st.markdown(f"### Top-Level KPIs {'(Scenario Comparison)' if is_scenario else '(Baseline)'}")
+    # st.markdown(f"### Top-Level KPIs {'(Scenario Comparison)' if is_scenario else '(Baseline)'}")
     c1, c2, c3, c4, c5 = st.columns(5)
     
     main_name = "Scenario" if is_scenario else "Baseline"
@@ -82,21 +82,21 @@ def render_dashboard_tab():
 
     st.markdown("---")
 
-    # ==========================================
-    # 2. FLOW SECTION
-    # ==========================================
-    st.header("Network Flow Section")
-    with st.expander("Sankey Chart: Supplier → Warehouse → State", expanded=True):
-        if is_scenario:
-            s_col1, s_col2 = st.columns(2)
-            with s_col1:
-                st.plotly_chart(help_sankey.build_sankey_chart(base_metrics, "Baseline Flow"), use_container_width=True)
-            with s_col2:
-                st.plotly_chart(help_sankey.build_sankey_chart(scen_metrics, "Scenario Flow"), use_container_width=True)
-        else:
-            st.plotly_chart(help_sankey.build_sankey_chart(base_metrics, "Baseline Flow"), use_container_width=True)
+    # # ==========================================
+    # # 2. FLOW SECTION
+    # # ==========================================
+    # st.header("Network Flow Section")
+    # with st.expander("Sankey Chart: Supplier → Warehouse → State", expanded=True):
+    #     if is_scenario:
+    #         s_col1, s_col2 = st.columns(2)
+    #         with s_col1:
+    #             st.plotly_chart(help_sankey.build_sankey_chart(base_metrics, "Baseline Flow"), use_container_width=True)
+    #         with s_col2:
+    #             st.plotly_chart(help_sankey.build_sankey_chart(scen_metrics, "Scenario Flow"), use_container_width=True)
+    #     else:
+    #         st.plotly_chart(help_sankey.build_sankey_chart(base_metrics, "Baseline Flow"), use_container_width=True)
 
-    st.markdown("---")
+    # st.markdown("---")
 
     # ==========================================
     # 3. COST BREAKDOWN SECTION
@@ -128,19 +128,19 @@ def render_dashboard_tab():
 
     st.markdown("---")
 
-    # ==========================================
-    # 4. WAREHOUSE UTILIZATION SECTION
-    # ==========================================
-    st.header('Warehouse Section')
-    with st.expander("Capacity Utilization Comparison", expanded=True):
+    # # ==========================================
+    # # 4. WAREHOUSE UTILIZATION SECTION
+    # # ==========================================
+    # st.header('Warehouse Section')
+    # with st.expander("Capacity Utilization Comparison", expanded=True):
         
-        wh_base = base_metrics['wh_details'][['wh_name', 'capacity_pallets', 'allocated_pallets']].copy()
-        wh_base.rename(columns={'allocated_pallets': 'base_used'}, inplace=True)
+    #     wh_base = base_metrics['wh_details'][['wh_name', 'capacity_pallets', 'allocated_pallets']].copy()
+    #     wh_base.rename(columns={'allocated_pallets': 'base_used'}, inplace=True)
         
-        wh_scen = None
-        if is_scenario:
-            wh_scen = scen_metrics['wh_details'][['wh_name', 'allocated_pallets']].copy()
-            wh_scen.rename(columns={'allocated_pallets': 'scen_used'}, inplace=True)
+    #     wh_scen = None
+    #     if is_scenario:
+    #         wh_scen = scen_metrics['wh_details'][['wh_name', 'allocated_pallets']].copy()
+    #         wh_scen.rename(columns={'allocated_pallets': 'scen_used'}, inplace=True)
 
-        util_chart = help_viz.build_capacity_utilization_chart(wh_base, wh_scen, is_scenario)
-        st.plotly_chart(util_chart, use_container_width=True)
+    #     util_chart = help_viz.build_capacity_utilization_chart(wh_base, wh_scen, is_scenario)
+    #     st.plotly_chart(util_chart, use_container_width=True)
