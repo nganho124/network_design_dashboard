@@ -1,30 +1,75 @@
-/* Sidebar width and layout adjustments */
-section[data-testid="stSidebar"] {
-    width: 350px !important; 
+/* Target only standard Streamlit buttons (Action buttons) */
+[data-testid="stSidebar"] div.stButton > button,
+[data-testid="stSidebar"] button[data-testid*="stBaseButton"] {
+    background-color: #FFFFFF !important;
+    border: 1px solid rgba(0, 0, 0, 0.08) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08) !important;
+    transition: all 0.2s ease !important;
 }
 
-div[data-testid="stSidebarUserContent"] {
-    padding-top: 0rem;
+/* Button text styling */
+[data-testid="stSidebar"] div.stButton > button p,
+[data-testid="stSidebar"] div.stButton > button [data-testid="stMarkdownContainer"],
+[data-testid="stSidebar"] button[data-testid*="stBaseButton"] p {
+    color: #8C3A3A !important;
+    font-weight: 700 !important;
 }
 
-/* Sidebar background color */
-[data-testid="stSidebar"] {
-    background-color: #BA5A5A;
+/* Button icons */
+[data-testid="stSidebar"] div.stButton > button svg,
+[data-testid="stSidebar"] button[data-testid*="stBaseButton"] svg {
+    fill: #8C3A3A !important;
 }
 
-/* Sidebar text and markdown styling */
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {
-    color: white;
-    font-weight: bold;
+/* Hover state for active action buttons */
+[data-testid="stSidebar"] div.stButton > button:hover:not(:disabled),
+[data-testid="stSidebar"] button[data-testid*="stBaseButton"]:hover:not(:disabled) {
+    background-color: #FFF5F5 !important;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12) !important;
 }
 
-/* Sidebar expander icons */
-[data-testid="stSidebar"] [data-testid="stExpanderToggleIcon"] {
-    color: white;
+/* Disabled state */
+[data-testid="stSidebar"] div.stButton > button:disabled,
+[data-testid="stSidebar"] button[data-testid*="stBaseButton"]:disabled {
+    background-color: rgba(255, 255, 255, 0.2) !important;
+    border: 1px solid rgba(255, 255, 255, 0.25) !important;
+    box-shadow: none !important;
+    cursor: not-allowed;
 }
 
-/* Sidebar collapse button */
-[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] {
-    z-index: 99999;
-    color: white;
+[data-testid="stSidebar"] div.stButton > button:disabled p,
+[data-testid="stSidebar"] div.stButton > button:disabled [data-testid="stMarkdownContainer"],
+[data-testid="stSidebar"] button[data-testid*="stBaseButton"]:disabled p {
+    color: rgba(255, 255, 255, 0.5) !important;
+}
+
+[data-testid="stSidebar"] div.stButton > button:disabled svg,
+[data-testid="stSidebar"] button[data-testid*="stBaseButton"]:disabled svg {
+    fill: rgba(255, 255, 255, 0.5) !important;
+}
+
+/* Explicit Reset for Help/Tooltip (?) Icon Button */
+[data-testid="stSidebar"] [data-testid="stTooltipHoverTarget"] button,
+[data-testid="stSidebar"] [data-testid="stTooltipHoverTarget"] {
+    background: transparent !important;
+    background-color: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+
+/* Tooltip icon color (subtle light gray/white) */
+[data-testid="stSidebar"] [data-testid="stTooltipHoverTarget"] svg {
+    fill: rgba(255, 255, 255, 0.7) !important;
+    color: rgba(255, 255, 255, 0.7) !important;
+}
+
+[data-testid="stSidebar"] [data-testid="stTooltipHoverTarget"]:hover svg {
+    fill: #FFFFFF !important;
+    color: #FFFFFF !important;
+}
+
+[data-testid="stMainBlockContainer"] {
+    padding-top: 2rem !important;
 }

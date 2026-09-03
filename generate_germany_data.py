@@ -493,6 +493,24 @@ def generate_delivery_baseline_share(stores: pd.DataFrame, warehouses: pd.DataFr
     return pd.DataFrame(rows)
 
 
+# def generate_delivery_baseline_share(stores: pd.DataFrame, warehouses: pd.DataFrame,
+#                                      product_groups: pd.DataFrame) -> pd.DataFrame:
+#     """Baseline fixed WH -> Store -> Group volume share (mirrors the real
+#     'Branch Delivery Share' dataset). Each store is served exclusively (100%)
+#     by its single nearest warehouse across all product groups."""
+#     nearest_series = assign_stores_to_nearest_wh(stores, warehouses)
+
+#     rows = []
+#     for store_id, primary_wh in nearest_series.items():
+#         for _, pg in product_groups.iterrows():
+#             rows.append({
+#                 "wh_id": primary_wh,
+#                 "store_id": store_id,
+#                 "group_id": pg["group_id"],
+#                 "volume_share": 1.0,
+#             })
+#     return pd.DataFrame(rows)
+
 def generate_supply_share(suppliers: pd.DataFrame, delivery_baseline_share: pd.DataFrame,
                            demand: pd.DataFrame, supply_baseline_share: pd.DataFrame,
                            extra_suppliers_per_group: int = 2,

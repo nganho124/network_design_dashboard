@@ -24,16 +24,14 @@ ASSETS_DIR = Path(__file__).parent.parent / "data/assets"
 ICON_OPEN = str(ASSETS_DIR / "warehouse_open.png")
 ICON_CLOSED = str(ASSETS_DIR / "warehouse_closed.png")
 
-# Explicit tile URL + attribution instead of the "cartodbpositron" alias —
-# sidesteps folium/xyzservices version differences in alias resolution.
-FREE_TILE_URL = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
-FREE_TILE_ATTR = (
-    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> '
-    'contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-)
+# # Explicit tile URL + attribution instead of the "cartodbpositron" alias —
+# # sidesteps folium/xyzservices version differences in alias resolution.
+CARTO_KEY = "cb1_2uqf_1_27afec78ab53ef3242fb9a61"
+CARTO_POSITRON_URL = f"https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png?key={CARTO_KEY}"
+CARTO_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
 
-STORE_COLOR = "#0077CF"
-
+STORE_COLOR = "#2FA4D7"
+LINE_COLOR = "#F4AE52"
 
 @st.cache_resource(show_spinner=False)
 def _build_map(_warehouses, _stores, _flows, open_wh_ids: tuple, flow_col: str, cache_key: str):
@@ -44,7 +42,10 @@ def _build_map(_warehouses, _stores, _flows, open_wh_ids: tuple, flow_col: str, 
     Leading-underscore params (_warehouses, _stores, _flows) are excluded
     from the cache key since DataFrames aren't hashable.
     """
-    m = folium.Map(location=[51.0, 10.0], zoom_start=6, tiles=FREE_TILE_URL, attr=FREE_TILE_ATTR)
+    m = folium.Map(location=[51.0, 10.0], 
+                   zoom_start=6,
+                   tiles=CARTO_POSITRON_URL,
+                   attr=CARTO_ATTR)
 
     # tiered line width by flow volume — same approach as the reference function
     # (fewer/wider lines are easier to read; many/thinner lines avoid clutter)
@@ -59,7 +60,9 @@ def _build_map(_warehouses, _stores, _flows, open_wh_ids: tuple, flow_col: str, 
                 continue
             folium.PolyLine(
                 locations=[wh_coord.loc[f["wh_id"]].tolist(), store_coord.loc[f["store_id"]].tolist()],
-                color="#F39C12", weight=line_width, opacity=0.6,
+                color=LINE_COLOR, 
+                weight=line_width, 
+                opacity=0.6,
                 tooltip=f"{f['wh_id']} → {f['store_id']}: {f[flow_col]:.1f} pallets",
             ).add_to(m)
 
@@ -87,9 +90,9 @@ def _build_map(_warehouses, _stores, _flows, open_wh_ids: tuple, flow_col: str, 
             location=[s["lat"], s["lon"]],
             popup=folium.Popup(f"Store: {s['store_id']}<br>City: {s['city']}", max_width=300),
             color=STORE_COLOR,
-            radius=3,          # reference used 0.05 (px), which is sub-pixel and effectively
+            radius=1,          # reference used 0.05 (px), which is sub-pixel and effectively
                                 # invisible in-browser — bumped up so stores are actually visible
-            opacity=0.5,
+            opacity=0.8,
             tooltip=folium.map.Tooltip(f"Store ID: {s['store_id']}"),
             fill=True,
             fillOpacity=0.4,
@@ -99,7 +102,7 @@ def _build_map(_warehouses, _stores, _flows, open_wh_ids: tuple, flow_col: str, 
 
 
 def render_map_tab():
-    st.subheader("Supply Chain Network")
+    # st.subheader("Supply Chain Network")
 
     warehouses = get_effective_warehouses()  # includes any greenfield sites added to this scenario
     stores = st.session_state.stores
@@ -107,15 +110,15 @@ def render_map_tab():
     results = st.session_state.results
 
     # --- manual controls (AI chat will call update_scenario() the same way) ---
-    with st.expander("Adjust network manually", expanded=False):
-        cols = st.columns(4)
-        for i, (_, wh) in enumerate(warehouses.iterrows()):
-            is_open = scenario["wh_status"][wh["wh_id"]] == "open"
-            label = f"{wh['wh_id']} — {wh['wh_name']}" + (" 🏗️" if wh.get("is_greenfield") else "")
-            new_val = cols[i % 4].checkbox(label, value=is_open, key=f"wh_toggle_{wh['wh_id']}")
-            if new_val != is_open:
-                update_scenario({"wh_status": {wh["wh_id"]: "open" if new_val else "closed"}})
-                st.rerun()
+    # with st.expander("Adjust network manually", expanded=False):
+    #     cols = st.columns(4)
+    #     for i, (_, wh) in enumerate(warehouses.iterrows()):
+    #         is_open = scenario["wh_status"][wh["wh_id"]] == "open"
+    #         label = f"{wh['wh_id']} — {wh['wh_name']}" + (" 🏗️" if wh.get("is_greenfield") else "")
+    #         new_val = cols[i % 4].checkbox(label, value=is_open, key=f"wh_toggle_{wh['wh_id']}")
+    #         if new_val != is_open:
+    #             update_scenario({"wh_status": {wh["wh_id"]: "open" if new_val else "closed"}})
+    #             st.rerun()
 
     # --- flows: prefer solved results once solver.py supports this schema; fall back to baseline ---
     if results and results.get("feasible"):
@@ -132,11 +135,11 @@ def render_map_tab():
     m = _build_map(warehouses, stores, flows, open_wh_ids, flow_col, cache_key)
     st_folium(m, width=None, height=560, returned_objects=[])
 
-    if results and results.get("feasible"):
-        st.caption("🟧 line = solved scenario flow · 🟢/⚫ warehouse = open/closed · "
-                    "🔵 dot = store · line width ≈ flow density")
-    else:
-        st.caption("🟧 line = baseline (fixed-share) flow, no scenario solved yet · "
-                    "🟢/⚫ warehouse = open/closed · 🔵 dot = store · "
-                    "closing a warehouse drops its flows but doesn't yet reallocate them "
-                    "(pending solver update)")
+    # if results and results.get("feasible"):
+    #     st.caption("🟧 line = solved scenario flow · 🟢/⚫ warehouse = open/closed · "
+    #                 "🔵 dot = store · line width ≈ flow density")
+    # else:
+    #     st.caption("🟧 line = baseline (fixed-share) flow, no scenario solved yet · "
+    #                 "🟢/⚫ warehouse = open/closed · 🔵 dot = store · "
+    #                 "closing a warehouse drops its flows but doesn't yet reallocate them "
+    #                 "(pending solver update)")

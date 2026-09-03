@@ -26,7 +26,7 @@ import streamlit as st
 
 from state import next_new_warehouse_id
 
-MODEL = "claude-opus-5"
+MODEL = "claude-sonnet-5"
 
 UPDATE_SCENARIO_TOOL = {
     "name": "update_scenario",

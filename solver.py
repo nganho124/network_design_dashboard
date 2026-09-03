@@ -86,7 +86,8 @@ def solve_network(scenario: dict,
                    supply_share: pd.DataFrame,
                    inbound_cost_tiers: pd.DataFrame,
                    transfer_cost: pd.DataFrame,
-                   forced_allocation: list | None = None) -> dict:
+                   forced_allocation: list | None = None,
+                   max_distance_km: float | None = None) -> dict:
     open_wh = [wh for wh, status in scenario["wh_status"].items() if status == "open"]
     if not open_wh:
         return {"feasible": False, "reason": "No warehouses are open — every store would be unserved."}
@@ -110,6 +111,7 @@ def solve_network(scenario: dict,
     handling_cost = warehouses.set_index("wh_id")["handling_cost_eur_pallet"].to_dict()
     delivery_cost_dict = delivery_cost.set_index(["wh_id", "store_id"])["cost_per_pallet_eur"].to_dict()
     days_to_serve_dict = delivery_cost.set_index(["wh_id", "store_id"])["days_to_serve"].to_dict()
+    distance_dict = delivery_cost.set_index(["wh_id", "store_id"])["distance_km"].to_dict() 
     inbound_cost_dict = inbound_cost.set_index(["supplier_id", "wh_id"])["cost_per_pallet_eur"].to_dict()
     transfer_cost_dict = transfer_cost.set_index(["wh_id_from", "wh_id_to"])["cost_per_pallet_eur"].to_dict()
 
@@ -150,7 +152,24 @@ def solve_network(scenario: dict,
     for dr in demand_recs:
         store_id, group_id = dr["store_id"], dr["group_id"]
         pins = pinned_by_store_group.get((store_id, group_id))
-        eligible_wh = [p["wh_id"] for p in pins] if pins else open_wh
+        candidate_wh = [p["wh_id"] for p in pins] if pins else open_wh
+        
+        # Filter by max_distance_km if specified
+        if max_distance_km is not None:
+            eligible_wh = [
+                wh_id for wh_id in candidate_wh
+                if distance_dict.get((wh_id, store_id), float("inf")) <= max_distance_km
+            ]
+        else:
+            eligible_wh = candidate_wh
+            
+        # Fast fail check if a store is completely out of reach
+        if not eligible_wh:
+            return {
+                "feasible": False,
+                "reason": f"Store {store_id} has no open warehouse within {max_distance_km} km."
+            }
+        
         for wh_id in eligible_wh:
             var = solver.NumVar(0, inf, f"d_{wh_id}_{store_id}_{group_id}")
             dist_flow[(wh_id, store_id, group_id)] = var
@@ -193,15 +212,21 @@ def solve_network(scenario: dict,
     # are eligible for it (all open ones, or just the forced_allocation pin(s))
     for dr in demand_recs:
         store_id, group_id, qty = dr["store_id"], dr["group_id"], dr["demand_pallets"]
-        pins = pinned_by_store_group.get((store_id, group_id))
-        eligible_wh = [p["wh_id"] for p in pins] if pins else open_wh
-        solver.Add(sum(dist_flow[(wh_id, store_id, group_id)] for wh_id in eligible_wh) == qty)
+        
+        # Only sum over created flow variables (respects max distance and pins)
+        active_vars = [
+            dist_flow[(wh_id, store_id, group_id)]
+            for wh_id in open_wh
+            if (wh_id, store_id, group_id) in dist_flow
+        ]
+        
+        solver.Add(sum(active_vars) == qty)
 
-        # hard-fixed split: pin(s) with an explicit volume_share exactly determine that
-        # warehouse's flow, rather than just restricting which warehouses are eligible
+        pins = pinned_by_store_group.get((store_id, group_id))
         if pins and pins[0]["volume_share"] is not None:
             for p in pins:
-                solver.Add(dist_flow[(p["wh_id"], store_id, group_id)] == qty * p["volume_share"])
+                if (p["wh_id"], store_id, group_id) in dist_flow:
+                    solver.Add(dist_flow[(p["wh_id"], store_id, group_id)] == qty * p["volume_share"])
 
     # warehouse throughput: outbound-to-store + outbound-transfer, which by flow balance
     # (below) equals total inbound — this is what actually caps a consolidation hub's

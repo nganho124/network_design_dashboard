@@ -17,7 +17,9 @@ from state import init_session_state, update_scenario, next_new_warehouse_id
 from components.map_view import render_map_tab
 from components.dashboard_view import render_dashboard_tab
 
-st.set_page_config(page_title="AI Supply Chain Network Advisor", layout="wide")
+st.set_page_config(page_title="AI Network Assistant", 
+                   layout="wide",
+                   page_icon="🚚")
 
 init_session_state()
 with open("styles.css") as f:
@@ -166,6 +168,7 @@ def _solve_current_scenario():
             inbound_cost_tiers,
             transfer_cost,
             st.session_state.scenario.get("forced_allocation", []),
+            200
         )
     st.session_state.results = results
     st.session_state.active_scenario_id = None  # freshly solved, not yet saved
@@ -252,60 +255,60 @@ def scenario_library_sidebar():
         st.sidebar.caption("Solve the current scenario to unlock saving.")
 
 
-def new_warehouse_sidebar():
-    """
-    Test opening a brand-new ("greenfield") warehouse at any known city —
-    no pre-set capacity; the solver sizes it to whatever throughput is
-    actually worth routing there (see solver.py, greenfield.py). Scenario-only
-    (state.py's new_warehouses): doesn't touch the permanent reference data.
-    """
-    st.sidebar.subheader("🏗️ Add a new warehouse")
+# def new_warehouse_sidebar():
+#     """
+#     Test opening a brand-new ("greenfield") warehouse at any known city —
+#     no pre-set capacity; the solver sizes it to whatever throughput is
+#     actually worth routing there (see solver.py, greenfield.py). Scenario-only
+#     (state.py's new_warehouses): doesn't touch the permanent reference data.
+#     """
+#     st.sidebar.subheader("🏗️ Add a new warehouse")
 
-    existing_ids = set(st.session_state.warehouses["wh_id"]) | {
-        nw["wh_id"] for nw in st.session_state.scenario.get("new_warehouses", [])
-    }
-    cities = sorted(st.session_state.city_directory["city"].tolist())
+#     existing_ids = set(st.session_state.warehouses["wh_id"]) | {
+#         nw["wh_id"] for nw in st.session_state.scenario.get("new_warehouses", [])
+#     }
+#     cities = sorted(st.session_state.city_directory["city"].tolist())
 
-    with st.sidebar.form("add_warehouse_form", clear_on_submit=True):
-        city = st.selectbox("City", cities, index=None, placeholder="Pick a city...", key="new_wh_city_select")
-        name = st.text_input("Warehouse name", placeholder="e.g. New WH Frankfurt", key="new_wh_name_input")
-        submitted = st.form_submit_button("Add warehouse", use_container_width=True)
+#     with st.sidebar.form("add_warehouse_form", clear_on_submit=True):
+#         city = st.selectbox("City", cities, index=None, placeholder="Pick a city...", key="new_wh_city_select")
+#         name = st.text_input("Warehouse name", placeholder="e.g. New WH Frankfurt", key="new_wh_name_input")
+#         submitted = st.form_submit_button("Add warehouse", use_container_width=True)
 
-    if submitted:
-        if not city:
-            st.sidebar.warning("Pick a city first.")
-        else:
-            wh_id = next_new_warehouse_id(existing_ids)
-            wh_name = name.strip() or f"New WH {city}"
-            update_scenario({
-                "new_warehouses": [{"wh_id": wh_id, "wh_name": wh_name, "city": city}],
-                "wh_status": {wh_id: "open"},
-            })
-            st.rerun()
+#     if submitted:
+#         if not city:
+#             st.sidebar.warning("Pick a city first.")
+#         else:
+#             wh_id = next_new_warehouse_id(existing_ids)
+#             wh_name = name.strip() or f"New WH {city}"
+#             update_scenario({
+#                 "new_warehouses": [{"wh_id": wh_id, "wh_name": wh_name, "city": city}],
+#                 "wh_status": {wh_id: "open"},
+#             })
+#             st.rerun()
 
-    new_whs = st.session_state.scenario.get("new_warehouses", [])
-    if new_whs:
-        st.sidebar.caption("Greenfield sites in this scenario:")
-        for nw in new_whs:
-            status = st.session_state.scenario["wh_status"].get(nw["wh_id"], "open")
-            st.sidebar.caption(f"• {nw['wh_name']} ({nw['city']}) — {status}")
+#     new_whs = st.session_state.scenario.get("new_warehouses", [])
+#     if new_whs:
+#         st.sidebar.caption("Greenfield sites in this scenario:")
+#         for nw in new_whs:
+#             status = st.session_state.scenario["wh_status"].get(nw["wh_id"], "open")
+#             st.sidebar.caption(f"• {nw['wh_name']} ({nw['city']}) — {status}")
 
 
 def main():
-    st.title("🚚 AI Supply Chain Network Advisor")
+    st.title("🚚 AI Network Assistant")
     st.caption("Test different network setups before committing to a real restructuring decision.")
 
     scenario_chat_sidebar()
     scenario_library_sidebar()
-    new_warehouse_sidebar()
+    # new_warehouse_sidebar()
 
     with st.sidebar:
         st.subheader("Warehouse status")
         wh_status = st.session_state.scenario["wh_status"]
         open_count = sum(1 for s in wh_status.values() if s == "open")
         st.metric("Open warehouses", f"{open_count} / {len(wh_status)}")
-        st.caption("Toggle warehouses from the map tab's 'Adjust network manually' panel, "
-                   "then Solve to see the reallocated network.")
+        # st.caption("Toggle warehouses from the map tab's 'Adjust network manually' panel, "
+        #            "then Solve to see the reallocated network.")
 
     tab1, tab2 = st.tabs(["🗺️ Network Map", "📊 Dashboard"])
     with tab1:
