@@ -1,47 +1,57 @@
-# AI Supply Chain Network Advisor — Scaffold
+# AI Supply Chain Network Advisor
+
+A Streamlit app for exploring "what-if" supply chain network scenarios
+(which warehouses to keep open, where to add a new one, how to route
+stores) for a synthetic Germany DIY/furniture retail network — with a
+Claude-powered chat that can propose scenario changes in natural language.
 
 ## Structure
 
 ```
-supply_chain_advisor/
-├── app.py                     # Entry point: layout, tabs, session_state init
-├── state.py                   # Scenario schema + session_state helpers
-├── data.py                    # Synthetic/sample data generation
-├── solver.py                  # OR-Tools network flow model (solve_network)
+network_design_dashboard/
+├── app.py                       # Entry point: layout, tabs, sidebar (scenario library + chat)
+├── state.py                     # Scenario schema + session_state helpers (single source of truth)
+├── solver.py                    # OR-Tools network flow model (solve_network)
+├── chat_assistant.py            # Natural language -> scenario patch, via Claude tool use
+├── greenfield.py                # Cost/geometry generation for new (not-yet-built) warehouses
+├── db.py                        # Persistence: reference data (parquet) + saved scenarios (SQLite)
+├── generate_germany_data.py     # Synthetic reference data generator
+├── styles.css                   # App styling
 ├── components/
-│   ├── map_view.py             # Tab 1: folium map of the network
-│   └── dashboard_view.py       # Tab 2: plotly cost/service charts
+│   ├── map_view.py              # Tab 1: folium map of the network
+│   └── dashboard_view.py        # Tab 2: KPI dashboard (cost/service charts)
+├── util/                        # Calculation and chart helpers used by dashboard_view.py
+├── data/
+│   ├── reference/                # Generated reference data (parquet) — warehouses, stores, costs, etc.
+│   ├── assets/                   # Icons used on the map
+│   └── scenarios.db              # Saved scenarios (SQLite)
 └── requirements.txt
 ```
 
 ## Design principle: single source of truth
 
 Everything reads and writes through `st.session_state.scenario` (the inputs)
-and `st.session_state.results` (the solver output). Map tab, dashboard tab,
-and — later — the chatbot all talk to this ONE object. Nothing talks to
+and `st.session_state.results` (the solver output). The map tab, dashboard
+tab, and chat assistant all talk to this ONE object — nothing talks to
 anything else directly.
 
 ```
 scenario (dict)  →  solve_network()  →  results (dict)
      ↑                                        ↓
-[map clicks]                          [map render, dashboard render]
-[chat message]  (added at hackathon)
+[map clicks / manual edits]           [map render, dashboard render]
+[chat message → scenario patch]
 ```
-
-## Why this matters for the hackathon night
-
-`solve_network(scenario) -> results` is a pure function with a typed input/output.
-When you add Claude on the night, the ONLY new code is:
-
-1. A tool/function-call schema that mirrors the `scenario` dict fields (see `state.py`)
-2. A parser step: user message → partial scenario update → merge into `st.session_state.scenario`
-3. Re-run `solve_network()` and re-render — same as any manual edit
-
-No architecture changes needed. This is the whole point of building it this way now.
 
 ## Run it
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
+```
+
+Reference data is generated once and cached under `data/reference/`. To
+regenerate it (e.g. after changing the data model):
+
+```bash
+python generate_germany_data.py
 ```
